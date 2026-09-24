@@ -110,10 +110,19 @@ const locateRelationship = (relationship: ParsedJDLRelationship, node: CstNode |
   locateRelationshipSide(relationship.from, firstChild(node, 'from'));
   locateRelationshipSide(relationship.to, firstChild(node, 'to'));
 
-  locateAnnotations(relationship.options.source, children(node, 'annotationOnSourceSide'));
-  locateAnnotations(relationship.options.destination, children(node, 'annotationOnDestinationSide'));
-
+  const sourceOptions = children(node, 'annotationOnSourceSide');
+  const destinationOptions = children(node, 'annotationOnDestinationSide');
   const globalOptions = firstChild(node, 'relationshipOptions');
+  const optionNodes = [...sourceOptions, ...destinationOptions, ...(globalOptions ? [globalOptions] : [])];
+
+  if (optionNodes.length > 0) {
+    optionNodes.forEach(optionNode => locateMerged(relationship.options, optionNode));
+  } else {
+    locate(relationship.options, node);
+  }
+
+  locateAnnotations(relationship.options.source, sourceOptions);
+  locateAnnotations(relationship.options.destination, destinationOptions);
   locateAnnotations(relationship.options.global, children(globalOptions, 'relationshipOption'));
 };
 
