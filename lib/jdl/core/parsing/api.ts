@@ -22,6 +22,7 @@ import { type CstNode, EOF, type IRecognitionException, type IToken } from 'chev
 import type { ParsedJDLApplications } from '../types/parsed.ts';
 import type { JDLRuntime } from '../types/runtime.ts';
 
+import { attachAstLocations } from './ast-locations.ts';
 import { buildJDLAstBuilderVisitor } from './jdl-ast-builder-visitor.ts';
 import performAdditionalSyntaxChecks from './validator.ts';
 
@@ -63,7 +64,7 @@ export function parse(input: string, runtime: JDLRuntime, options?: ParseOptions
 
   try {
     const astBuilderVisitor = buildJDLAstBuilderVisitor(runtime);
-    ast = astBuilderVisitor.visit(cst) as ParsedJDLApplications;
+    ast = attachAstLocations(astBuilderVisitor.visit(cst) as ParsedJDLApplications, cst);
   } catch (error) {
     diagnostics.push({
       severity: 'error',
@@ -87,7 +88,7 @@ export const parseWithDiagnostics = parse;
 export function parseOrThrow(input: string, runtime: JDLRuntime, options?: ParseOptions): ParsedJDLApplications {
   const cst = getCst(input, runtime, options);
   const astBuilderVisitor = buildJDLAstBuilderVisitor(runtime);
-  return astBuilderVisitor.visit(cst) as ParsedJDLApplications;
+  return attachAstLocations(astBuilderVisitor.visit(cst) as ParsedJDLApplications, cst);
 }
 
 /** Legacy throwing CST API kept for generator compatibility. */
