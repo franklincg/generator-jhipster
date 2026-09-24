@@ -25,16 +25,22 @@ import { getDefaultJDLEntityConfig } from './jdl-entity-config.ts';
 import { getDefaultJDLRelationshipConfig } from './jdl-relationship-config.ts';
 import { getDefaultJDLApplicationConfig, getDefaultJDLDeploymentConfig } from './jhipster-jdl-config.ts';
 
+/** The complete set of JHipster JDL definitions used by the default runtime. */
+export const getDefaultJDLDefinitions = (): JDLDefinitions => ({
+  application: getDefaultJDLApplicationConfig(),
+  deployment: getDefaultJDLDeploymentConfig(),
+  entity: getDefaultJDLEntityConfig(),
+  relationship: getDefaultJDLRelationshipConfig(),
+});
+
 /**
  * A runtime from the JHipster definitions, the ones not passed: the application and deployment options of the
  * generators, the entity and relationship option statements.
  */
 export const createJDLRuntime = (definitions: Partial<JDLDefinitions> = {}): JDLRuntime =>
   createRuntime({
-    application: definitions.application ?? getDefaultJDLApplicationConfig(),
-    deployment: definitions.deployment ?? getDefaultJDLDeploymentConfig(),
-    entity: definitions.entity ?? getDefaultJDLEntityConfig(),
-    relationship: definitions.relationship ?? getDefaultJDLRelationshipConfig(),
+    ...getDefaultJDLDefinitions(),
+    ...definitions,
   });
 
 let defaultRuntime: JDLRuntime;

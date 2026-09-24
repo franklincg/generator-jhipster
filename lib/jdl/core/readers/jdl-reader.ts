@@ -19,7 +19,7 @@
 
 import { readFileSync } from 'node:fs';
 
-import { getCst as apiGetCst, parse as apiParser } from '../parsing/api.ts';
+import { getCst as apiGetCst, parseOrThrow as apiParser } from '../parsing/api.ts';
 import performJDLPostParsingTasks from '../parsing/jdl-post-parsing-tasks.ts';
 import type { JDLRuntime } from '../types/runtime.ts';
 import logger from '../utils/objects/logger.ts';

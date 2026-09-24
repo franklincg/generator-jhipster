@@ -19,19 +19,32 @@
 import type { ApplicationType } from '../../../core/application-types.ts';
 import type { RelationshipType } from '../basic-types/relationships.ts';
 
-export type ParsedJDLAnnotation = {
+export type ParsedJDLLocation = {
+  startOffset: number;
+  endOffset: number;
+  startLine?: number;
+  endLine?: number;
+  startColumn?: number;
+  endColumn?: number;
+};
+
+export type ParsedJDLNode = {
+  location?: ParsedJDLLocation;
+};
+
+export type ParsedJDLAnnotation = ParsedJDLNode & {
   optionName: string;
   type: 'UNARY' | 'BINARY';
   optionValue?: boolean | string | number;
 };
 
-export type ParsedJDLValidation = {
+export type ParsedJDLValidation = ParsedJDLNode & {
   key: string;
   value?: string | number | RegExp | boolean;
   constant?: boolean;
 };
 
-export type ParsedJDLEntityField = {
+export type ParsedJDLEntityField = ParsedJDLNode & {
   annotations?: ParsedJDLAnnotation[];
   validations: ParsedJDLValidation[];
   name: string;
@@ -39,47 +52,47 @@ export type ParsedJDLEntityField = {
   documentation?: string;
 };
 
-export type ParsedJDLEntity = {
+export type ParsedJDLEntity = ParsedJDLNode & {
   name: string;
   tableName?: string;
   documentation?: string;
   annotations?: ParsedJDLAnnotation[];
   body?: ParsedJDLEntityField[];
 };
-export type ParsedJDLApplicationConfig = {
+export type ParsedJDLApplicationConfig = ParsedJDLNode & {
   baseName: string;
 } & Record<string, any>;
 
-export type ParsedJDLEnumValue = {
+export type ParsedJDLEnumValue = ParsedJDLNode & {
   key: string;
   value?: string;
   comment?: string;
 };
 
-export type ParsedJDLEnum = {
+export type ParsedJDLEnum = ParsedJDLNode & {
   name: string;
   values: ParsedJDLEnumValue[];
   documentation?: string;
 };
 
-export type ParsedJDLOptionConfig = {
+export type ParsedJDLOptionConfig = ParsedJDLNode & {
   list: string[]; // entity names
   excluded: string[]; // excluded entity names
 };
 
-export type ParsedJDLOption = {
+export type ParsedJDLOption = ParsedJDLNode & {
   optionName: string;
 } & ParsedJDLOptionConfig;
 
-export type ParsedJDLBinaryOption = {
+export type ParsedJDLBinaryOption = ParsedJDLNode & {
   optionValue: string;
 } & ParsedJDLOption;
 
-export type ParsedJDLUseOption = {
+export type ParsedJDLUseOption = ParsedJDLNode & {
   optionValues: string[];
 } & ParsedJDLOptionConfig;
 
-export type ParsedJDLApplication = {
+export type ParsedJDLApplication = ParsedJDLNode & {
   config: ParsedJDLApplicationConfig;
   namespaceConfigs?: Record<string, Record<string, boolean | number | string[] | string>>;
   entities?: string[];
@@ -87,33 +100,33 @@ export type ParsedJDLApplication = {
   useOptions?: ParsedJDLUseOption[];
 };
 
-export type ParsedJDLDeployment = {
+export type ParsedJDLDeployment = ParsedJDLNode & {
   deploymentType: string;
   appsFolders?: string[];
   dockerRepositoryName?: string;
 };
 
-export type ParsedJDLRelationshipSide = {
+export type ParsedJDLRelationshipSide = ParsedJDLNode & {
   name: string;
   injectedField?: string;
   required: boolean;
   documentation?: string;
 };
 
-export type ParsedJDLRelationshipOption = {
+export type ParsedJDLRelationshipOption = ParsedJDLNode & {
   global: ParsedJDLAnnotation[];
   source: ParsedJDLAnnotation[];
   destination: ParsedJDLAnnotation[];
 };
 
-export type ParsedJDLRelationship = {
+export type ParsedJDLRelationship = ParsedJDLNode & {
   from: ParsedJDLRelationshipSide;
   to: ParsedJDLRelationshipSide;
   cardinality: RelationshipType;
   options: ParsedJDLRelationshipOption;
 };
 
-export type ParsedJDLApplications = {
+export type ParsedJDLApplications = ParsedJDLNode & {
   applications: (ParsedJDLApplication & { entitiesOptions?: { entityList: string[]; excluded: string[] } })[];
   entities: ParsedJDLEntity[];
   relationships: ParsedJDLRelationship[];
@@ -124,7 +137,7 @@ export type ParsedJDLApplications = {
   useOptions: ParsedJDLUseOption[];
 };
 
-export type ParsedJDLRoot = {
+export type ParsedJDLRoot = ParsedJDLNode & {
   parsedContent: ParsedJDLApplications;
   document?: ParsedJDLApplications; // deprecated
   entities?: ParsedJDLEntity[];

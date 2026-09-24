@@ -26,8 +26,8 @@ const noopCst = undefined as unknown as CstNode;
 export default class JDLParser extends CstParser {
   private readonly tokens: Record<string, TokenType>;
 
-  constructor(tokens: Record<string, TokenType>) {
-    super(tokens, { outputCst: true } as any);
+  constructor(tokens: Record<string, TokenType>, recoveryEnabled = false) {
+    super(tokens, { outputCst: true, recoveryEnabled } as any);
     this.tokens = tokens;
   }
 
