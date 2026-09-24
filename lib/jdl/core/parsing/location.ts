@@ -58,9 +58,6 @@ const mergeLocations = (locations: ParsedJDLLocation[]): ParsedJDLLocation | und
   };
 };
 
-const locationOf = (element: LocatedCstElement): ParsedJDLLocation | undefined =>
-  'image' in element ? fromToken(element) : fromCstNode(element);
-
 const fromCstNode = (node: CstNode): ParsedJDLLocation | undefined => {
   const location = node.location;
   if (location && numeric(location.startOffset)) {
@@ -79,10 +76,13 @@ const fromCstNode = (node: CstNode): ParsedJDLLocation | undefined => {
   return mergeLocations(
     Object.values(node.children)
       .flatMap(elements => (elements ?? []) as LocatedCstElement[])
-      .map(locationOf)
+      .map(element => ('image' in element ? fromToken(element) : fromCstNode(element)))
       .filter((childLocation): childLocation is ParsedJDLLocation => childLocation !== undefined),
   );
 };
+
+const locationOf = (element: LocatedCstElement): ParsedJDLLocation | undefined =>
+  'image' in element ? fromToken(element) : fromCstNode(element);
 
 export const locationFromContext = (context: VisitorLocationContext): ParsedJDLLocation | undefined =>
   mergeLocations(
