@@ -21,21 +21,25 @@ import { describe, expect, it } from 'esmocha';
 
 import { getDefaultRuntime } from '../../../jdl-config/jdl-runtime.ts';
 
-import { parse, parseWithDiagnostics } from './api.ts';
+import { parse, parseOrThrow, parseWithDiagnostics } from './api.ts';
 
 describe('jdl - diagnostics parser API', () => {
   const jdlRuntime = getDefaultRuntime();
 
   it('returns an AST and no diagnostics for valid input', () => {
-    const result = parseWithDiagnostics('entity Person { name String }', jdlRuntime);
+    const result = parse('entity Person { name String }', jdlRuntime);
 
     expect(result.diagnostics).toEqual([]);
     expect(result.ast?.entities).toHaveLength(1);
     expect(result.ast?.entities[0].name).toBe('Person');
   });
 
+  it('keeps parseWithDiagnostics as an alias for the public parse contract', () => {
+    expect(parseWithDiagnostics).toBe(parse);
+  });
+
   it('reports lexer errors with source ranges without throwing', () => {
-    const result = parseWithDiagnostics('entity ± {', jdlRuntime);
+    const result = parse('entity ± {', jdlRuntime);
 
     expect(result.diagnostics.some(diagnostic => diagnostic.source === 'lexer')).toBe(true);
     const diagnostic = result.diagnostics.find(diagnostic => diagnostic.source === 'lexer')!;
@@ -44,7 +48,7 @@ describe('jdl - diagnostics parser API', () => {
   });
 
   it('reports parser errors with a rule id and range', () => {
-    const result = parseWithDiagnostics('entity Person { ]', jdlRuntime);
+    const result = parse('entity Person { ]', jdlRuntime);
 
     const diagnostic = result.diagnostics.find(diagnostic => diagnostic.source === 'parser')!;
     expect(diagnostic).toBeDefined();
@@ -52,7 +56,7 @@ describe('jdl - diagnostics parser API', () => {
     expect(diagnostic.range.start.line).toBe(1);
   });
 
-  it('keeps the existing fail-fast parser available to generator callers', () => {
-    expect(() => parse('entity Person { ]', jdlRuntime)).toThrow();
+  it('keeps the fail-fast parser available to generator callers', () => {
+    expect(() => parseOrThrow('entity Person { ]', jdlRuntime)).toThrow();
   });
 });
