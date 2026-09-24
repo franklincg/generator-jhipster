@@ -88,7 +88,7 @@ export const parseWithDiagnostics = parse;
 export function parseOrThrow(input: string, runtime: JDLRuntime, options?: ParseOptions): ParsedJDLApplications {
   const cst = getCst(input, runtime, options);
   const astBuilderVisitor = buildJDLAstBuilderVisitor(runtime);
-  return attachAstLocations(astBuilderVisitor.visit(cst) as ParsedJDLApplications, cst);
+  return astBuilderVisitor.visit(cst) as ParsedJDLApplications;
 }
 
 /** Legacy throwing CST API kept for generator compatibility. */
