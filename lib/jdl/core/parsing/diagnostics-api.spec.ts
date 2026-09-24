@@ -34,6 +34,26 @@ describe('jdl - diagnostics parser API', () => {
     expect(result.ast?.entities[0].name).toBe('Person');
   });
 
+  it('attaches source locations to parsed AST nodes', () => {
+    const input = 'entity Person {\n  name String required\n}';
+    const result = parse(input, jdlRuntime);
+    const entity = result.ast?.entities[0];
+    const field = entity?.body?.[0];
+    const validation = field?.validations[0];
+
+    expect(result.diagnostics).toEqual([]);
+    expect(result.ast?.location).toMatchObject({ startOffset: 0, endOffset: input.length - 1 });
+    expect(entity?.location).toMatchObject({ startOffset: 0, endOffset: input.length - 1 });
+    expect(field?.location).toBeDefined();
+    expect(validation?.location).toBeDefined();
+
+    const fieldLocation = field!.location!;
+    expect(input.slice(fieldLocation.startOffset, fieldLocation.endOffset + 1)).toBe('name String required');
+
+    const validationLocation = validation!.location!;
+    expect(input.slice(validationLocation.startOffset, validationLocation.endOffset + 1)).toBe('required');
+  });
+
   it('keeps parseWithDiagnostics as an alias for the public parse contract', () => {
     expect(parseWithDiagnostics).toBe(parse);
   });
