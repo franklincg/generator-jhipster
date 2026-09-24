@@ -40,31 +40,7 @@ const fromToken = (token: IToken): ParsedJDLLocation | undefined => {
   };
 };
 
-const fromCstNode = (node: CstNode): ParsedJDLLocation | undefined => {
-  const { location } = node;
-  if (!numeric(location.startOffset)) {
-    return undefined;
-  }
-
-  return {
-    startOffset: location.startOffset,
-    endOffset: numeric(location.endOffset) ? location.endOffset : location.startOffset,
-    ...(numeric(location.startLine) ? { startLine: location.startLine } : {}),
-    ...(numeric(location.endLine) ? { endLine: location.endLine } : {}),
-    ...(numeric(location.startColumn) ? { startColumn: location.startColumn } : {}),
-    ...(numeric(location.endColumn) ? { endColumn: location.endColumn } : {}),
-  };
-};
-
-const locationOf = (element: LocatedCstElement): ParsedJDLLocation | undefined =>
-  'image' in element ? fromToken(element) : fromCstNode(element);
-
-export const locationFromContext = (context: VisitorLocationContext): ParsedJDLLocation | undefined => {
-  const locations = Object.values(context)
-    .flatMap(elements => elements ?? [])
-    .map(locationOf)
-    .filter((location): location is ParsedJDLLocation => location !== undefined);
-
+const mergeLocations = (locations: ParsedJDLLocation[]): ParsedJDLLocation | undefined => {
   if (locations.length === 0) {
     return undefined;
   }
@@ -81,3 +57,37 @@ export const locationFromContext = (context: VisitorLocationContext): ParsedJDLL
     ...(end.endColumn !== undefined ? { endColumn: end.endColumn } : {}),
   };
 };
+
+const locationOf = (element: LocatedCstElement): ParsedJDLLocation | undefined =>
+  'image' in element ? fromToken(element) : fromCstNode(element);
+
+const fromCstNode = (node: CstNode): ParsedJDLLocation | undefined => {
+  const location = node.location;
+  if (location && numeric(location.startOffset)) {
+    return {
+      startOffset: location.startOffset,
+      endOffset: numeric(location.endOffset) ? location.endOffset : location.startOffset,
+      ...(numeric(location.startLine) ? { startLine: location.startLine } : {}),
+      ...(numeric(location.endLine) ? { endLine: location.endLine } : {}),
+      ...(numeric(location.startColumn) ? { startColumn: location.startColumn } : {}),
+      ...(numeric(location.endColumn) ? { endColumn: location.endColumn } : {}),
+    };
+  }
+
+  // Node location tracking is optional in Chevrotain. Fall back to descendant
+  // tokens so tooling still gets stable ranges without changing parser config.
+  return mergeLocations(
+    Object.values(node.children)
+      .flatMap(elements => (elements ?? []) as LocatedCstElement[])
+      .map(locationOf)
+      .filter((childLocation): childLocation is ParsedJDLLocation => childLocation !== undefined),
+  );
+};
+
+export const locationFromContext = (context: VisitorLocationContext): ParsedJDLLocation | undefined =>
+  mergeLocations(
+    Object.values(context)
+      .flatMap(elements => elements ?? [])
+      .map(locationOf)
+      .filter((location): location is ParsedJDLLocation => location !== undefined),
+  );
