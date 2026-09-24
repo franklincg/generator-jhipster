@@ -52,27 +52,12 @@ export type JDLParseResult = {
 };
 
 /**
- * Existing fail-fast parser API used by generator code. Kept stable while the
- * diagnostics API is introduced; once all internal callers are migrated this
- * becomes the throwing compatibility wrapper requested by the public tooling
- * API transition.
- */
-export function parse(input: string, runtime: JDLRuntime, options?: ParseOptions): ParsedJDLApplications {
-  const cst = getCst(input, runtime, options);
-  const astBuilderVisitor = buildJDLAstBuilderVisitor(runtime);
-  return astBuilderVisitor.visit(cst) as ParsedJDLApplications;
-}
-
-/** Explicit compatibility name for callers that require fail-fast behaviour. */
-export const parseOrThrow = parse;
-
-/**
  * Tooling-oriented parser API. It returns a best-effort AST together with
  * structured diagnostics instead of stopping at the first error. Chevrotain
  * recovery is enabled on the runtime parser so editors and linters can keep
  * working with incomplete documents.
  */
-export function parseWithDiagnostics(input: string, runtime: JDLRuntime, options?: ParseOptions): JDLParseResult {
+export function parse(input: string, runtime: JDLRuntime, options?: ParseOptions): JDLParseResult {
   const { cst, diagnostics } = getCstWithDiagnostics(input, runtime, options);
   let ast: ParsedJDLApplications | undefined;
 
@@ -90,6 +75,19 @@ export function parseWithDiagnostics(input: string, runtime: JDLRuntime, options
   }
 
   return { ast, diagnostics };
+}
+
+/** Backward-compatible explicit name for the diagnostics-returning API. */
+export const parseWithDiagnostics = parse;
+
+/**
+ * Throwing compatibility wrapper used by generator code and callers that need
+ * the historical fail-fast behaviour.
+ */
+export function parseOrThrow(input: string, runtime: JDLRuntime, options?: ParseOptions): ParsedJDLApplications {
+  const cst = getCst(input, runtime, options);
+  const astBuilderVisitor = buildJDLAstBuilderVisitor(runtime);
+  return astBuilderVisitor.visit(cst) as ParsedJDLApplications;
 }
 
 /** Legacy throwing CST API kept for generator compatibility. */
