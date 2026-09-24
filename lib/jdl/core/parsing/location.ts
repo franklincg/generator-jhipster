@@ -59,7 +59,7 @@ const mergeLocations = (locations: ParsedJDLLocation[]): ParsedJDLLocation | und
 };
 
 const fromCstNode = (node: CstNode): ParsedJDLLocation | undefined => {
-  const location = node.location;
+  const { location } = node;
   if (location && numeric(location.startOffset)) {
     return {
       startOffset: location.startOffset,
