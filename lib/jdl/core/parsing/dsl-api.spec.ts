@@ -21,7 +21,7 @@ import { before, describe, expect, it } from 'esmocha';
 
 import { getDefaultRuntime } from '../../../jdl-config/jdl-runtime.ts';
 
-import { parse } from './api.ts';
+import { parseOrThrow } from './api.ts';
 
 describe('jdl - JDL DSL API', () => {
   const jdlRuntime = getDefaultRuntime();
@@ -31,7 +31,7 @@ describe('jdl - JDL DSL API', () => {
       let ast: any;
 
       before(() => {
-        ast = parse('@service(serviceClass) entity A {@Id field String}', jdlRuntime);
+        ast = parseOrThrow('@service(serviceClass) entity A {@Id field String}', jdlRuntime);
       });
 
       it('should return an AST', () => {
@@ -58,7 +58,7 @@ describe('jdl - JDL DSL API', () => {
       let parseInvalidToken: () => any;
 
       before(() => {
-        parseInvalidToken = () => parse('entity ± {', jdlRuntime);
+        parseInvalidToken = () => parseOrThrow('entity ± {', jdlRuntime);
       });
 
       it('should throw an error with the offset information', () => {
@@ -75,7 +75,7 @@ describe('jdl - JDL DSL API', () => {
         let parseWrongClosingBraces: () => any;
 
         before(() => {
-          parseWrongClosingBraces = () => parse('entity Person { ]', jdlRuntime);
+          parseWrongClosingBraces = () => parseOrThrow('entity Person { ]', jdlRuntime);
         });
 
         it('should throw an error with position information', () => {
@@ -98,7 +98,7 @@ describe('jdl - JDL DSL API', () => {
         let parseMissingClosingBraces: () => any;
 
         before(() => {
-          parseMissingClosingBraces = () => parse('entity Person {', jdlRuntime);
+          parseMissingClosingBraces = () => parseOrThrow('entity Person {', jdlRuntime);
         });
 
         it('should throw an error with typeof MismatchTokenException', () => {
@@ -118,7 +118,7 @@ describe('jdl - JDL DSL API', () => {
       it('should throw an error', () => {
         // lower case entityName first char
         const invalidInput = 'entity person { }';
-        expect(() => parse(invalidInput, jdlRuntime)).toThrow(/.+\/\^\[A-Z][^]+line: 1.+column: 8/);
+        expect(() => parseOrThrow(invalidInput, jdlRuntime)).toThrow(/.+\/\^\[A-Z][^]+line: 1.+column: 8/);
       });
     });
   });
