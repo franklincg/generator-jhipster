@@ -136,9 +136,7 @@ function getCstWithDiagnostics(input: string, runtime: JDLRuntime, options?: Par
   diagnostics.push(...runtime.parser.errors.map(error => diagnosticFromRecognitionError(error, input, 'parser')));
 
   try {
-    diagnostics.push(
-      ...performAdditionalSyntaxChecks(cst, runtime).map(error => diagnosticFromRecognitionError(error, input, 'syntax')),
-    );
+    diagnostics.push(...performAdditionalSyntaxChecks(cst, runtime).map(error => diagnosticFromRecognitionError(error, input, 'syntax')));
   } catch (error) {
     diagnostics.push({
       severity: 'error',
@@ -152,12 +150,8 @@ function getCstWithDiagnostics(input: string, runtime: JDLRuntime, options?: Par
   return { cst, diagnostics };
 }
 
-function diagnosticFromRecognitionError(
-  error: IRecognitionException,
-  input: string,
-  source: 'parser' | 'syntax',
-): JDLDiagnostic {
-  const context = (error as IRecognitionException & { context?: { ruleStack?: string[] } }).context;
+function diagnosticFromRecognitionError(error: IRecognitionException, input: string, source: 'parser' | 'syntax'): JDLDiagnostic {
+  const { context } = error as IRecognitionException & { context?: { ruleStack?: string[] } };
   const ruleId = context?.ruleStack?.at(-1) ?? error.name ?? source;
   return {
     severity: 'error',

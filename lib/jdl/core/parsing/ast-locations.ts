@@ -40,11 +40,9 @@ type Locatable = ParsedJDLNode & Record<string, any>;
 const isCstNode = (element: CstElement): element is CstNode => 'children' in element;
 const isToken = (element: CstElement): element is IToken => 'image' in element;
 
-const children = (node: CstNode | undefined, key: string): CstNode[] =>
-  ((node?.children[key] ?? []) as CstElement[]).filter(isCstNode);
+const children = (node: CstNode | undefined, key: string): CstNode[] => ((node?.children[key] ?? []) as CstElement[]).filter(isCstNode);
 
-const tokens = (node: CstNode | undefined, key: string): IToken[] =>
-  ((node?.children[key] ?? []) as CstElement[]).filter(isToken);
+const tokens = (node: CstNode | undefined, key: string): IToken[] => ((node?.children[key] ?? []) as CstElement[]).filter(isToken);
 
 const firstChild = (node: CstNode | undefined, key: string): CstNode | undefined => children(node, key)[0];
 
