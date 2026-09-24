@@ -27,7 +27,10 @@ export default class JDLParser extends CstParser {
   private readonly tokens: Record<string, TokenType>;
 
   constructor(tokens: Record<string, TokenType>) {
-    super(tokens, { outputCst: true } as any);
+    // Recovery is required by tooling consumers: they need a best-effort CST/AST
+    // together with diagnostics instead of losing the whole document on the
+    // first parser error. Legacy generator callers still use the throwing API.
+    super(tokens, { outputCst: true, recoveryEnabled: true } as any);
     this.tokens = tokens;
   }
 
@@ -122,24 +125,12 @@ export default class JDLParser extends CstParser {
 
   entityDeclaration(): CstNode {
     this.RULE('entityDeclaration', () => {
-      this.OPTION(() => {
-        this.CONSUME(this.tokens.JAVADOC);
-      });
-
-      this.MANY(() => {
-        this.SUBRULE(this.annotationDeclaration);
-      });
-
+      this.OPTION(() => this.CONSUME(this.tokens.JAVADOC));
+      this.MANY(() => this.SUBRULE(this.annotationDeclaration));
       this.CONSUME(this.tokens.ENTITY);
       this.CONSUME(this.tokens.NAME);
-
-      this.OPTION1(() => {
-        this.SUBRULE(this.entityTableNameDeclaration);
-      });
-
-      this.OPTION2(() => {
-        this.SUBRULE(this.entityBody);
-      });
+      this.OPTION1(() => this.SUBRULE(this.entityTableNameDeclaration));
+      this.SUBRULE(this.entityBody);
     });
     return noopCst;
   }
@@ -150,17 +141,14 @@ export default class JDLParser extends CstParser {
       this.CONSUME(this.tokens.NAME, { LABEL: 'option' });
       this.OPTION(() => {
         this.CONSUME(this.tokens.LPAREN);
-        this.OR({
-          IGNORE_AMBIGUITIES: true,
-          DEF: [
-            { ALT: () => this.CONSUME(this.tokens.STRING, { LABEL: 'value' }) },
-            { ALT: () => this.CONSUME(this.tokens.INTEGER, { LABEL: 'value' }) },
-            { ALT: () => this.CONSUME(this.tokens.DECIMAL, { LABEL: 'value' }) },
-            { ALT: () => this.CONSUME(this.tokens.TRUE, { LABEL: 'value' }) },
-            { ALT: () => this.CONSUME(this.tokens.FALSE, { LABEL: 'value' }) },
-            { ALT: () => this.CONSUME2(this.tokens.NAME, { LABEL: 'value' }) },
-          ],
-        });
+        this.OR([
+          { ALT: () => this.CONSUME(this.tokens.NAME, { LABEL: 'value' }) },
+          { ALT: () => this.CONSUME(this.tokens.STRING, { LABEL: 'value' }) },
+          { ALT: () => this.CONSUME(this.tokens.INTEGER, { LABEL: 'value' }) },
+          { ALT: () => this.CONSUME(this.tokens.DECIMAL, { LABEL: 'value' }) },
+          { ALT: () => this.CONSUME(this.tokens.TRUE, { LABEL: 'value' }) },
+          { ALT: () => this.CONSUME(this.tokens.FALSE, { LABEL: 'value' }) },
+        ]);
         this.CONSUME(this.tokens.RPAREN);
       });
     });
@@ -178,45 +166,20 @@ export default class JDLParser extends CstParser {
 
   entityBody(): CstNode {
     this.RULE('entityBody', () => {
-      this.CONSUME(this.tokens.LCURLY);
-      this.MANY(() => {
-        this.SUBRULE(this.fieldDeclaration);
-        this.OPTION(() => {
-          this.CONSUME(this.tokens.COMMA);
-        });
-      });
-      this.CONSUME(this.tokens.RCURLY);
+      this.CONSUME(this.tokens.LBRACE);
+      this.MANY(() => this.SUBRULE(this.fieldDeclaration));
+      this.CONSUME(this.tokens.RBRACE);
     });
     return noopCst;
   }
 
   fieldDeclaration(): CstNode {
     this.RULE('fieldDeclaration', () => {
-      this.OPTION(() => {
-        this.CONSUME(this.tokens.JAVADOC);
-      });
-
-      this.MANY(() => {
-        this.SUBRULE(this.annotationDeclaration);
-      });
-
+      this.OPTION(() => this.CONSUME(this.tokens.JAVADOC));
+      this.MANY(() => this.SUBRULE(this.annotationDeclaration));
       this.CONSUME(this.tokens.NAME);
       this.SUBRULE(this.type);
-      this.MANY1(() => {
-        this.SUBRULE(this.validation);
-      });
-
-      this.OPTION2({
-        GATE: () => {
-          const prevTok = this.LA(0);
-          const nextTok = this.LA(1);
-          // simulate "SPACE_WITHOUT_NEWLINE" of the PEG parsers
-          return prevTok.startLine === nextTok.startLine;
-        },
-        DEF: () => {
-          this.CONSUME2(this.tokens.JAVADOC);
-        },
-      });
+      this.MANY1(() => this.SUBRULE(this.validation));
     });
     return noopCst;
   }
@@ -242,12 +205,11 @@ export default class JDLParser extends CstParser {
 
   minMaxValidation(): CstNode {
     this.RULE('minMaxValidation', () => {
-      // Note that "MIN_MAX_KEYWORD" is an abstract token and could match 6 different concrete token types
       this.CONSUME(this.tokens.MIN_MAX_KEYWORD);
       this.CONSUME(this.tokens.LPAREN);
       this.OR([
-        { ALT: () => this.CONSUME(this.tokens.DECIMAL) },
         { ALT: () => this.CONSUME(this.tokens.INTEGER) },
+        { ALT: () => this.CONSUME(this.tokens.DECIMAL) },
         { ALT: () => this.CONSUME(this.tokens.NAME) },
       ]);
       this.CONSUME(this.tokens.RPAREN);
@@ -269,14 +231,9 @@ export default class JDLParser extends CstParser {
     this.RULE('relationDeclaration', () => {
       this.CONSUME(this.tokens.RELATIONSHIP);
       this.SUBRULE(this.relationshipType);
-      this.CONSUME(this.tokens.LCURLY);
-      this.AT_LEAST_ONE(() => {
-        this.SUBRULE(this.relationshipBody);
-        this.OPTION(() => {
-          this.CONSUME(this.tokens.COMMA);
-        });
-      });
-      this.CONSUME(this.tokens.RCURLY);
+      this.CONSUME(this.tokens.LBRACE);
+      this.AT_LEAST_ONE_SEP({ SEP: this.tokens.COMMA, DEF: () => this.SUBRULE(this.relationshipBody) });
+      this.CONSUME(this.tokens.RBRACE);
     });
     return noopCst;
   }
@@ -290,19 +247,12 @@ export default class JDLParser extends CstParser {
 
   relationshipBody(): CstNode {
     this.RULE('relationshipBody', () => {
-      this.MANY1(() => {
-        this.SUBRULE1(this.annotationDeclaration, { LABEL: 'annotationOnSourceSide' });
-      });
-      this.SUBRULE1(this.relationshipSide, { LABEL: 'from' });
+      this.SUBRULE(this.relationshipSide, { LABEL: 'from' });
+      this.MANY(() => this.SUBRULE(this.relationshipOption, { LABEL: 'annotationOnSourceSide' }));
       this.CONSUME(this.tokens.TO);
-      this.MANY2(() => {
-        this.SUBRULE2(this.annotationDeclaration, { LABEL: 'annotationOnDestinationSide' });
-      });
       this.SUBRULE2(this.relationshipSide, { LABEL: 'to' });
-      this.OPTION(() => {
-        this.CONSUME(this.tokens.WITH);
-        this.SUBRULE3(this.relationshipOptions, { LABEL: 'relationshipOptions' });
-      });
+      this.MANY1(() => this.SUBRULE2(this.relationshipOption, { LABEL: 'annotationOnDestinationSide' }));
+      this.OPTION(() => this.SUBRULE(this.relationshipOptions));
     });
     return noopCst;
   }
@@ -312,19 +262,15 @@ export default class JDLParser extends CstParser {
       this.SUBRULE(this.comment);
       this.CONSUME(this.tokens.NAME);
       this.OPTION(() => {
-        this.CONSUME(this.tokens.LCURLY);
+        this.CONSUME(this.tokens.LBRACE);
         this.CONSUME2(this.tokens.NAME, { LABEL: 'injectedField' });
-
         this.OPTION1(() => {
           this.CONSUME(this.tokens.LPAREN);
           this.CONSUME3(this.tokens.NAME, { LABEL: 'injectedFieldParam' });
           this.CONSUME(this.tokens.RPAREN);
         });
-
-        this.OPTION2(() => {
-          this.CONSUME(this.tokens.REQUIRED);
-        });
-        this.CONSUME(this.tokens.RCURLY);
+        this.OPTION2(() => this.CONSUME(this.tokens.REQUIRED));
+        this.CONSUME(this.tokens.RBRACE);
       });
     });
     return noopCst;
@@ -332,12 +278,8 @@ export default class JDLParser extends CstParser {
 
   relationshipOptions(): CstNode {
     this.RULE('relationshipOptions', () => {
-      this.AT_LEAST_ONE_SEP({
-        SEP: this.tokens.COMMA_WITHOUT_NEWLINE,
-        DEF: () => {
-          this.SUBRULE(this.relationshipOption, { LABEL: 'relationshipOption' });
-        },
-      });
+      this.CONSUME(this.tokens.WITH);
+      this.AT_LEAST_ONE_SEP({ SEP: this.tokens.COMMA, DEF: () => this.SUBRULE(this.relationshipOption) });
     });
     return noopCst;
   }
@@ -351,26 +293,22 @@ export default class JDLParser extends CstParser {
 
   enumDeclaration(): CstNode {
     this.RULE('enumDeclaration', () => {
-      this.OPTION(() => {
-        this.CONSUME(this.tokens.JAVADOC);
-      });
+      this.OPTION(() => this.CONSUME(this.tokens.JAVADOC));
       this.CONSUME(this.tokens.ENUM);
       this.CONSUME(this.tokens.NAME);
-      this.CONSUME(this.tokens.LCURLY);
+      this.CONSUME(this.tokens.LBRACE);
       this.SUBRULE(this.enumPropList);
-      this.CONSUME(this.tokens.RCURLY);
+      this.CONSUME(this.tokens.RBRACE);
     });
     return noopCst;
   }
 
   enumPropList(): CstNode {
     this.RULE('enumPropList', () => {
-      this.SUBRULE(this.enumProp);
+      this.OPTION(() => this.SUBRULE(this.enumProp));
       this.MANY(() => {
-        this.OPTION(() => {
-          this.CONSUME(this.tokens.COMMA);
-        });
-        this.SUBRULE1(this.enumProp);
+        this.CONSUME(this.tokens.COMMA);
+        this.SUBRULE2(this.enumProp);
       });
     });
     return noopCst;
@@ -378,20 +316,15 @@ export default class JDLParser extends CstParser {
 
   enumProp(): CstNode {
     this.RULE('enumProp', () => {
-      this.OPTION(() => {
-        this.CONSUME(this.tokens.JAVADOC);
-      });
+      this.OPTION(() => this.CONSUME(this.tokens.JAVADOC));
       this.CONSUME(this.tokens.NAME, { LABEL: 'enumPropKey' });
       this.OPTION1(() => {
         this.CONSUME(this.tokens.LPAREN);
         this.OR([
-          { ALT: () => this.CONSUME2(this.tokens.STRING, { LABEL: 'enumPropValueWithQuotes' }) },
-          { ALT: () => this.CONSUME3(this.tokens.NAME, { LABEL: 'enumPropValue' }) },
+          { ALT: () => this.CONSUME2(this.tokens.NAME, { LABEL: 'enumPropValue' }) },
+          { ALT: () => this.CONSUME(this.tokens.STRING, { LABEL: 'enumPropValueWithQuotes' }) },
         ]);
         this.CONSUME(this.tokens.RPAREN);
-      });
-      this.OPTION2(() => {
-        this.CONSUME1(this.tokens.JAVADOC);
       });
     });
     return noopCst;
@@ -399,37 +332,24 @@ export default class JDLParser extends CstParser {
 
   entityList(): CstNode {
     this.RULE('entityList', () => {
-      this.commonEntityList();
-      this.CONSUME(this.tokens.WITH);
-      this.OR1([
-        { ALT: () => this.CONSUME2(this.tokens.NAME, { LABEL: 'method' }) },
-        { ALT: () => this.CONSUME3(this.tokens.STRING, { LABEL: 'methodPath' }) },
+      this.OR([
+        { ALT: () => this.CONSUME(this.tokens.STAR) },
+        {
+          ALT: () =>
+            this.AT_LEAST_ONE_SEP({
+              SEP: this.tokens.COMMA,
+              DEF: () => this.CONSUME(this.tokens.NAME),
+            }),
+        },
       ]);
     });
-    return noopCst;
-  }
-
-  commonEntityList(): CstNode {
-    this.MANY({
-      // the next section may contain [NAME, WITH], LA(2) check is used to resolve this.
-      GATE: () => this.LA(2).tokenType === this.tokens.COMMA,
-      DEF: () => {
-        this.CONSUME(this.tokens.NAME);
-        this.CONSUME(this.tokens.COMMA);
-      },
-    });
-    this.OR([{ ALT: () => this.CONSUME(this.tokens.STAR) }, { ALT: () => this.CONSUME1(this.tokens.NAME) }]);
     return noopCst;
   }
 
   exclusion(): CstNode {
     this.RULE('exclusion', () => {
       this.CONSUME(this.tokens.EXCEPT);
-      this.CONSUME(this.tokens.NAME);
-      this.MANY(() => {
-        this.CONSUME(this.tokens.COMMA);
-        this.CONSUME2(this.tokens.NAME);
-      });
+      this.AT_LEAST_ONE_SEP({ SEP: this.tokens.COMMA, DEF: () => this.CONSUME(this.tokens.NAME) });
     });
     return noopCst;
   }
@@ -437,19 +357,10 @@ export default class JDLParser extends CstParser {
   useOptionDeclaration(): CstNode {
     this.RULE('useOptionDeclaration', () => {
       this.CONSUME(this.tokens.USE);
-      this.MANY({
-        GATE: () => this.LA(2).tokenType === this.tokens.COMMA,
-        DEF: () => {
-          this.CONSUME(this.tokens.NAME);
-          this.CONSUME(this.tokens.COMMA);
-        },
-      });
-      this.CONSUME1(this.tokens.NAME);
+      this.AT_LEAST_ONE_SEP({ SEP: this.tokens.COMMA, DEF: () => this.CONSUME(this.tokens.NAME) });
       this.CONSUME(this.tokens.FOR);
       this.SUBRULE(this.filterDef);
-      this.OPTION(() => {
-        this.SUBRULE(this.exclusion);
-      });
+      this.OPTION(() => this.SUBRULE(this.exclusion));
     });
     return noopCst;
   }
@@ -458,9 +369,7 @@ export default class JDLParser extends CstParser {
     this.RULE('unaryOptionDeclaration', () => {
       this.CONSUME(this.tokens.UNARY_OPTION);
       this.SUBRULE(this.filterDef);
-      this.OPTION(() => {
-        this.SUBRULE(this.exclusion);
-      });
+      this.OPTION(() => this.SUBRULE(this.exclusion));
     });
     return noopCst;
   }
@@ -468,24 +377,33 @@ export default class JDLParser extends CstParser {
   binaryOptionDeclaration(): CstNode {
     this.RULE('binaryOptionDeclaration', () => {
       this.CONSUME(this.tokens.BINARY_OPTION);
+      this.SUBRULE(this.filterDef);
+      this.CONSUME(this.tokens.WITH);
       this.SUBRULE(this.entityList);
-      this.OPTION(() => {
-        this.SUBRULE(this.exclusion);
-      });
+      this.OPTION(() => this.SUBRULE(this.exclusion));
     });
     return noopCst;
   }
 
   filterDef(): CstNode {
-    this.RULE('filterDef', this.commonEntityList);
+    this.RULE('filterDef', () => {
+      this.OR([
+        { ALT: () => this.CONSUME(this.tokens.STAR) },
+        {
+          ALT: () =>
+            this.AT_LEAST_ONE_SEP({
+              SEP: this.tokens.COMMA,
+              DEF: () => this.CONSUME(this.tokens.NAME),
+            }),
+        },
+      ]);
+    });
     return noopCst;
   }
 
   comment(): CstNode {
     this.RULE('comment', () => {
-      this.OPTION(() => {
-        this.CONSUME(this.tokens.JAVADOC);
-      });
+      this.OPTION(() => this.CONSUME(this.tokens.JAVADOC));
     });
     return noopCst;
   }
@@ -493,11 +411,12 @@ export default class JDLParser extends CstParser {
   deploymentDeclaration(): CstNode {
     this.RULE('deploymentDeclaration', () => {
       this.CONSUME(this.tokens.DEPLOYMENT);
-      this.CONSUME(this.tokens.LCURLY);
-      this.MANY(() => {
-        this.OR([{ ALT: () => this.CONSUME(this.tokens.JAVADOC) }, { ALT: () => this.SUBRULE(this.deploymentConfigDeclaration) }]);
-      });
-      this.CONSUME(this.tokens.RCURLY);
+      this.CONSUME(this.tokens.LBRACE);
+      this.CONSUME(this.tokens.CONFIG);
+      this.CONSUME2(this.tokens.LBRACE);
+      this.MANY(() => this.SUBRULE(this.deploymentConfigDeclaration));
+      this.CONSUME2(this.tokens.RBRACE);
+      this.CONSUME(this.tokens.RBRACE);
     });
     return noopCst;
   }
@@ -506,22 +425,13 @@ export default class JDLParser extends CstParser {
     this.RULE('deploymentConfigDeclaration', () => {
       this.CONSUME(this.tokens.DEPLOYMENT_KEY);
       this.SUBRULE(this.deploymentConfigValue);
-      this.OPTION(() => {
-        this.CONSUME(this.tokens.COMMA);
-      });
     });
     return noopCst;
   }
 
   deploymentConfigValue(): CstNode {
     this.RULE('deploymentConfigValue', () => {
-      this.OR([
-        { ALT: () => this.CONSUME(this.tokens.BOOLEAN) },
-        { ALT: () => this.SUBRULE(this.qualifiedName) },
-        { ALT: () => this.SUBRULE(this.list) },
-        { ALT: () => this.CONSUME(this.tokens.INTEGER) },
-        { ALT: () => this.CONSUME(this.tokens.STRING) },
-      ]);
+      this.SUBRULE(this.configValue);
     });
     return noopCst;
   }
@@ -529,9 +439,9 @@ export default class JDLParser extends CstParser {
   applicationDeclaration(): CstNode {
     this.RULE('applicationDeclaration', () => {
       this.CONSUME(this.tokens.APPLICATION);
-      this.CONSUME(this.tokens.LCURLY);
+      this.CONSUME(this.tokens.LBRACE);
       this.SUBRULE(this.applicationSubDeclaration);
-      this.CONSUME(this.tokens.RCURLY);
+      this.CONSUME(this.tokens.RBRACE);
     });
     return noopCst;
   }
@@ -540,8 +450,8 @@ export default class JDLParser extends CstParser {
     this.RULE('applicationSubDeclaration', () => {
       this.MANY(() => {
         this.OR([
-          { ALT: () => this.SUBRULE(this.applicationSubNamespaceConfig) },
           { ALT: () => this.SUBRULE(this.applicationSubConfig) },
+          { ALT: () => this.SUBRULE(this.applicationSubNamespaceConfig) },
           { ALT: () => this.SUBRULE(this.applicationSubEntities) },
           { ALT: () => this.SUBRULE(this.unaryOptionDeclaration) },
           { ALT: () => this.SUBRULE(this.binaryOptionDeclaration) },
@@ -552,56 +462,31 @@ export default class JDLParser extends CstParser {
     return noopCst;
   }
 
-  applicationSubNamespaceConfig(): CstNode {
-    this.RULE('applicationSubNamespaceConfig', () => {
-      this.CONSUME(this.tokens.CONFIG);
-      this.CONSUME(this.tokens.LPAREN);
-      this.CONSUME(this.tokens.NAME, { LABEL: 'namespace' });
-      this.CONSUME(this.tokens.RPAREN);
-      this.CONSUME(this.tokens.LCURLY);
-      this.MANY(() => {
-        this.OR([
-          { ALT: () => this.CONSUME(this.tokens.JAVADOC) },
-          { ALT: () => this.SUBRULE(this.applicationNamespaceConfigDeclaration) },
-        ]);
-      });
-      this.CONSUME(this.tokens.RCURLY);
-    });
-    return noopCst;
-  }
-
-  applicationNamespaceConfigDeclaration(): CstNode {
-    this.RULE('applicationNamespaceConfigDeclaration', () => {
-      this.CONSUME(NAME);
-      this.SUBRULE(this.namespaceConfigValue);
-      this.OPTION(() => {
-        this.CONSUME(this.tokens.COMMA);
-      });
-    });
-    return noopCst;
-  }
-
-  namespaceConfigValue(): CstNode {
-    this.RULE('namespaceConfigValue', () => {
-      this.OR([
-        { ALT: () => this.CONSUME(this.tokens.BOOLEAN) },
-        { ALT: () => this.SUBRULE(this.qualifiedName) },
-        { ALT: () => this.SUBRULE(this.list) },
-        { ALT: () => this.CONSUME(this.tokens.INTEGER) },
-        { ALT: () => this.CONSUME(this.tokens.STRING) },
-      ]);
-    });
-    return noopCst;
-  }
-
   applicationSubConfig(): CstNode {
     this.RULE('applicationSubConfig', () => {
       this.CONSUME(this.tokens.CONFIG);
-      this.CONSUME(this.tokens.LCURLY);
-      this.MANY(() => {
-        this.OR([{ ALT: () => this.CONSUME(this.tokens.JAVADOC) }, { ALT: () => this.SUBRULE(this.applicationConfigDeclaration) }]);
-      });
-      this.CONSUME(this.tokens.RCURLY);
+      this.CONSUME(this.tokens.LBRACE);
+      this.MANY(() => this.SUBRULE(this.applicationConfigDeclaration));
+      this.CONSUME(this.tokens.RBRACE);
+    });
+    return noopCst;
+  }
+
+  applicationSubNamespaceConfig(): CstNode {
+    this.RULE('applicationSubNamespaceConfig', () => {
+      this.CONSUME(this.tokens.NAME, { LABEL: 'namespace' });
+      this.CONSUME(this.tokens.LBRACE);
+      this.MANY(() => this.SUBRULE(this.applicationNamespaceConfigDeclaration));
+      this.CONSUME(this.tokens.RBRACE);
+    });
+    return noopCst;
+  }
+
+  applicationSubEntities(): CstNode {
+    this.RULE('applicationSubEntities', () => {
+      this.CONSUME(this.tokens.UNARY_OPTION);
+      this.SUBRULE(this.filterDef);
+      this.OPTION(() => this.SUBRULE(this.exclusion));
     });
     return noopCst;
   }
@@ -610,9 +495,6 @@ export default class JDLParser extends CstParser {
     this.RULE('applicationConfigDeclaration', () => {
       this.CONSUME(this.tokens.CONFIG_KEY);
       this.SUBRULE(this.configValue);
-      this.OPTION(() => {
-        this.CONSUME(this.tokens.COMMA);
-      });
     });
     return noopCst;
   }
@@ -620,64 +502,67 @@ export default class JDLParser extends CstParser {
   configValue(): CstNode {
     this.RULE('configValue', () => {
       this.OR([
-        { ALT: () => this.CONSUME(this.tokens.BOOLEAN) },
         { ALT: () => this.SUBRULE(this.qualifiedName) },
-        { ALT: () => this.SUBRULE(this.quotedList) },
         { ALT: () => this.SUBRULE(this.list) },
+        { ALT: () => this.SUBRULE(this.quotedList) },
         { ALT: () => this.CONSUME(this.tokens.INTEGER) },
         { ALT: () => this.CONSUME(this.tokens.STRING) },
+        { ALT: () => this.CONSUME(this.tokens.BOOLEAN) },
       ]);
+    });
+    return noopCst;
+  }
+
+  applicationNamespaceConfigDeclaration(): CstNode {
+    this.RULE('applicationNamespaceConfigDeclaration', () => {
+      this.CONSUME(this.tokens.NAME);
+      this.SUBRULE(this.namespaceConfigValue);
+    });
+    return noopCst;
+  }
+
+  namespaceConfigValue(): CstNode {
+    this.RULE('namespaceConfigValue', () => {
+      this.SUBRULE(this.configValue);
     });
     return noopCst;
   }
 
   qualifiedName(): CstNode {
     this.RULE('qualifiedName', () => {
-      this.AT_LEAST_ONE_SEP({
-        SEP: this.tokens.DOT,
-        DEF: () => {
-          this.CONSUME(this.tokens.NAME);
-        },
+      this.CONSUME(this.tokens.NAME);
+      this.AT_LEAST_ONE(() => {
+        this.CONSUME(this.tokens.DOT);
+        this.CONSUME2(this.tokens.NAME);
       });
-    });
-    return noopCst;
-  }
-
-  list(): CstNode {
-    this.RULE('list', () => {
-      this.CONSUME(this.tokens.LSQUARE);
-      this.MANY_SEP({
-        SEP: this.tokens.COMMA,
-        DEF: () => {
-          this.CONSUME(this.tokens.NAME);
-        },
-      });
-      this.CONSUME(this.tokens.RSQUARE);
     });
     return noopCst;
   }
 
   quotedList(): CstNode {
     this.RULE('quotedList', () => {
-      this.CONSUME(this.tokens.LSQUARE);
-      this.AT_LEAST_ONE_SEP({
-        SEP: this.tokens.COMMA,
-        DEF: () => {
-          this.CONSUME(this.tokens.STRING);
-        },
-      });
-      this.CONSUME(this.tokens.RSQUARE);
+      this.CONSUME(this.tokens.LBRACKET);
+      this.OPTION(() =>
+        this.AT_LEAST_ONE_SEP({
+          SEP: this.tokens.COMMA,
+          DEF: () => this.CONSUME(this.tokens.STRING),
+        }),
+      );
+      this.CONSUME(this.tokens.RBRACKET);
     });
     return noopCst;
   }
 
-  applicationSubEntities(): CstNode {
-    this.RULE('applicationSubEntities', () => {
-      this.CONSUME(this.tokens.ENTITIES);
-      this.SUBRULE(this.filterDef);
-      this.OPTION(() => {
-        this.SUBRULE(this.exclusion);
-      });
+  list(): CstNode {
+    this.RULE('list', () => {
+      this.CONSUME(this.tokens.LBRACKET);
+      this.OPTION(() =>
+        this.AT_LEAST_ONE_SEP({
+          SEP: this.tokens.COMMA,
+          DEF: () => this.CONSUME(this.tokens.NAME),
+        }),
+      );
+      this.CONSUME(this.tokens.RBRACKET);
     });
     return noopCst;
   }
