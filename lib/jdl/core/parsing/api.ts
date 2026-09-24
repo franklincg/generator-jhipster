@@ -24,6 +24,7 @@ import type { JDLRuntime } from '../types/runtime.ts';
 
 import { attachAstLocations } from './ast-locations.ts';
 import { buildJDLAstBuilderVisitor } from './jdl-ast-builder-visitor.ts';
+import JDLParser from './jdl-parser.ts';
 import performAdditionalSyntaxChecks from './validator.ts';
 
 type ParseOptions = { startRule?: string };
@@ -130,10 +131,12 @@ function getCstWithDiagnostics(input: string, runtime: JDLRuntime, options?: Par
     })),
   );
 
-  runtime.parser.input = lexResult.tokens;
-  const cst = (runtime.parser as unknown as Record<string, () => CstNode>)[options?.startRule ?? 'prog']();
+  const parser = new JDLParser(runtime.tokens, true);
+  parser.parse();
+  parser.input = lexResult.tokens;
+  const cst = (parser as unknown as Record<string, () => CstNode>)[options?.startRule ?? 'prog']();
 
-  diagnostics.push(...runtime.parser.errors.map(error => diagnosticFromRecognitionError(error, input, 'parser')));
+  diagnostics.push(...parser.errors.map(error => diagnosticFromRecognitionError(error, input, 'parser')));
 
   try {
     diagnostics.push(...performAdditionalSyntaxChecks(cst, runtime).map(error => diagnosticFromRecognitionError(error, input, 'syntax')));
