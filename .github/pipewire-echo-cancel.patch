@@ -1,4 +1,4 @@
-From ab1df7f929d46657d3344d1fae9b9c44c92d6fe1 Mon Sep 17 00:00:00 2001
+From c95e916e21afe2352c3f6bbd96a64f8a360c48bd Mon Sep 17 00:00:00 2001
 From: Franklin Wilster <64386813+franklincg@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 12:10:42 -0300
 Subject: [PATCH] pulse-server: add echo-cancel filter routing policy
