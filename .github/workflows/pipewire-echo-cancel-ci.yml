@@ -1,0 +1,70 @@
+name: PipeWire echo-cancel validation
+
+on:
+  push:
+    branches:
+      - ci/pipewire-echo-cancel
+
+permissions:
+  contents: read
+
+jobs:
+  linux-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git meson ninja-build pkg-config \
+            libdbus-1-dev libsystemd-dev libudev-dev libglib2.0-dev
+
+      - name: Clone PipeWire and apply patch
+        run: |
+          git clone --filter=blob:none https://gitlab.freedesktop.org/pipewire/pipewire.git pipewire
+          cd pipewire
+          git checkout 4cd2f7cb1
+          git am "$GITHUB_WORKSPACE/.github/pipewire-echo-cancel.patch"
+
+      - name: Configure
+        working-directory: pipewire
+        run: |
+          meson setup build \
+            -Dtests=enabled \
+            -Ddocs=disabled \
+            -Dman=disabled \
+            -Dsession-managers=[] \
+            -Decho-cancel-webrtc=disabled
+
+      - name: Build pulse server and focused regression test
+        working-directory: pipewire
+        run: |
+          meson compile -C build pipewire-pulse pw-test-pulse-filter
+
+      - name: Run focused regression test
+        working-directory: pipewire
+        run: |
+          meson test -C build --print-errorlogs pw-test-pulse-filter
+
+      - name: Configure ASan/UBSan
+        working-directory: pipewire
+        run: |
+          meson setup build-asan \
+            -Dtests=enabled \
+            -Ddocs=disabled \
+            -Dman=disabled \
+            -Dsession-managers=[] \
+            -Decho-cancel-webrtc=disabled \
+            -Db_sanitize=address,undefined
+
+      - name: Build and run ASan/UBSan focused test
+        working-directory: pipewire
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          meson compile -C build-asan pw-test-pulse-filter
+          meson test -C build-asan --print-errorlogs pw-test-pulse-filter
