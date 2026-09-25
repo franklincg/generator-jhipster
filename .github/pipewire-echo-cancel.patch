@@ -1,0 +1,1640 @@
+From ab1df7f929d46657d3344d1fae9b9c44c92d6fe1 Mon Sep 17 00:00:00 2001
+From: Franklin Wilster <64386813+franklincg@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 12:10:42 -0300
+Subject: [PATCH] pulse-server: add echo-cancel filter routing policy
+
+---
+ src/modules/meson.build                       |  11 +
+ src/modules/module-protocol-pulse/filter.c    | 711 ++++++++++++++++++
+ src/modules/module-protocol-pulse/filter.h    |  22 +
+ src/modules/module-protocol-pulse/internal.h  |   1 +
+ .../modules/pulse-module-echo-cancel.c        |  20 +-
+ .../module-protocol-pulse/pulse-server.c      |  26 +-
+ src/modules/module-protocol-pulse/stream.c    |   4 +
+ src/modules/module-protocol-pulse/stream.h    |   1 +
+ .../module-protocol-pulse/test-filter.c       | 626 +++++++++++++++
+ 9 files changed, 1411 insertions(+), 11 deletions(-)
+ create mode 100644 src/modules/module-protocol-pulse/filter.c
+ create mode 100644 src/modules/module-protocol-pulse/filter.h
+ create mode 100644 src/modules/module-protocol-pulse/test-filter.c
+
+diff --git a/src/modules/meson.build b/src/modules/meson.build
+index 27ca1c789..34a7f0bd0 100644
+--- a/src/modules/meson.build
++++ b/src/modules/meson.build
+@@ -317,6 +317,7 @@ pipewire_module_protocol_pulse_sources = [
+   'module-protocol-pulse/collect.c',
+   'module-protocol-pulse/cmd.c',
+   'module-protocol-pulse/extension.c',
++  'module-protocol-pulse/filter.c',
+   'module-protocol-pulse/format.c',
+   'module-protocol-pulse/manager.c',
+   'module-protocol-pulse/message.c',
+@@ -420,6 +421,16 @@ pipewire_module_protocol_pulse = shared_library('pipewire-module-protocol-pulse'
+   dependencies : pipewire_module_protocol_pulse_deps,
+ )
+ 
++if get_option('tests').allowed()
++  test('pw-test-pulse-filter',
++    executable('pw-test-pulse-filter',
++      'module-protocol-pulse/test-filter.c',
++      include_directories : [configinc],
++      dependencies : [pipewire_dep],
++    ),
++  )
++endif
++
+ build_module_pulse_tunnel = pulseaudio_dep.found()
+   if build_module_pulse_tunnel
+     pipewire_module_pulse_tunnel = shared_library('pipewire-module-pulse-tunnel',
+diff --git a/src/modules/module-protocol-pulse/filter.c b/src/modules/module-protocol-pulse/filter.c
+new file mode 100644
+index 000000000..1f0c8f7cf
+--- /dev/null
++++ b/src/modules/module-protocol-pulse/filter.c
+@@ -0,0 +1,711 @@
++/* PipeWire */
++/* SPDX-License-Identifier: MIT */
++
++#include <ctype.h>
++
++#include <spa/utils/string.h>
++
++#include "client.h"
++#include "collect.h"
++#include "defs.h"
++#include "filter.h"
++#include "internal.h"
++#include "log.h"
++#include "manager.h"
++#include "module.h"
++#include "stream.h"
++
++/* Echo cancellation needs both halves of a conversation. Keep the underlying
++ * route separate from the temporary metadata used to route through the filter.
++ * In particular, never pass an automatic move through the user move handler:
++ * moving to the default there deliberately forgets the preferred device. */
++struct filter {
++	struct module *module;
++	struct spa_hook listener;
++	unsigned int ref;
++	uint64_t sink, source;
++	char *parameters;
++	bool failed;
++};
++
++struct filter_stream {
++	struct filter_stream *next;
++	struct stream *stream;
++	struct filter *filter;
++	struct pw_properties *target;
++	struct pw_properties *pending;
++	struct pw_properties *metadata;
++	char *restore_target;
++	struct pw_timer timer;
++	uint64_t master;
++	uint64_t destination;
++	unsigned int echoes;
++	enum { MOVE_IDLE, MOVE_GUARD, MOVE_WAIT, MOVE_UNGUARD, MOVE_USER, MOVE_ROLLBACK } phase;
++	bool automatic;
++	bool restoring;
++	bool heuristic;
++	bool manual;
++	bool wanted;
++	bool guarded;
++};
++
++static const char *target_keys[] = { METADATA_TARGET_NODE, METADATA_TARGET_OBJECT };
++
++static const char *object_property(struct pw_manager_object *o, const char *key)
++{
++	struct pw_node_info *info = o->info;
++	if (info && info->props)
++		return spa_dict_lookup(info->props, key);
++	return o->props ? pw_properties_get(o->props, key) : NULL;
++}
++
++static struct pw_manager_object *find_serial(struct client *client, uint64_t serial)
++{
++	struct pw_manager_object *o;
++	if (client->manager)
++		spa_list_for_each(o, &client->manager->object_list, link)
++			if (!o->removing && o->serial == serial)
++				return o;
++	return NULL;
++}
++
++static struct pw_manager_object *stream_object(struct stream *s)
++{
++	struct pw_manager_object *o;
++	if (s->client->manager && s->stream)
++		spa_list_for_each(o, &s->client->manager->object_list, link)
++			if (!o->removing && o->id == s->id && spa_streq(o->type, PW_TYPE_INTERFACE_Node))
++				return o;
++	return NULL;
++}
++
++static struct filter_stream *ensure_stream(struct stream *s)
++{
++	struct filter_stream *fs;
++	if ((fs = s->filter) != NULL)
++		return fs;
++	if ((fs = calloc(1, sizeof(*fs))) == NULL)
++		return NULL;
++	fs->target = pw_properties_new(NULL, NULL);
++	fs->pending = pw_properties_new(NULL, NULL);
++	fs->metadata = pw_properties_new(NULL, NULL);
++	if (fs->target == NULL || fs->pending == NULL || fs->metadata == NULL) {
++		pw_properties_free(fs->target);
++		pw_properties_free(fs->pending);
++		pw_properties_free(fs->metadata);
++		free(fs);
++		return NULL;
++	}
++	fs->stream = s;
++	fs->next = s->impl->filter_streams;
++	s->impl->filter_streams = fs;
++	/* PulseAudio merges client properties into each new stream. Inherit the
++	 * filter request and grouping keys here as well (stream values win). */
++	if (s->client->props && s->stream) {
++		static const char *keys[] = { "filter.want", "filter.apply", "filter.suppress",
++			"filter.apply.echo-cancel.parameters", PW_KEY_MEDIA_ROLE, PW_KEY_APP_ID,
++			PW_KEY_APP_NAME };
++		struct spa_dict_item items[SPA_N_ELEMENTS(keys)];
++		uint32_t n = 0, i;
++		const struct pw_properties *props = pw_stream_get_properties(s->stream);
++		for (i = 0; i < SPA_N_ELEMENTS(keys); i++) {
++			const char *value = pw_properties_get(s->client->props, keys[i]);
++			if (value && pw_properties_get(props, keys[i]) == NULL)
++				items[n++] = SPA_DICT_ITEM_INIT(keys[i], value);
++		}
++		pw_stream_update_properties(s->stream, &SPA_DICT_INIT(items, n));
++	}
++	return s->filter = fs;
++}
++
++static void promote_stream(struct filter_stream *fs)
++{
++	struct filter_stream **p;
++	for (p = &fs->stream->impl->filter_streams; *p != fs; p = &(*p)->next)
++		;
++	*p = fs->next;
++	fs->next = fs->stream->impl->filter_streams;
++	fs->stream->impl->filter_streams = fs;
++}
++
++static void filter_destroyed(void *data)
++{
++	struct filter *f = data;
++	spa_hook_remove(&f->listener);
++	f->module = NULL;
++}
++
++static const struct module_events filter_events = {
++	VERSION_MODULE_EVENTS,
++	.destroy = filter_destroyed,
++};
++
++static void filter_unref(struct filter *f)
++{
++	if (f == NULL || --f->ref > 0)
++		return;
++	if (f->module) {
++		spa_hook_remove(&f->listener);
++		module_schedule_unload(f->module);
++	}
++	free(f->parameters);
++	free(f);
++}
++
++void filter_stream_free(struct stream *s)
++{
++	struct filter_stream *fs = s->filter, **p;
++	if (fs == NULL)
++		return;
++	for (p = &s->impl->filter_streams; *p != fs; p = &(*p)->next)
++		;
++	*p = fs->next;
++	pw_timer_queue_cancel(&fs->timer);
++	filter_unref(fs->filter);
++	pw_properties_free(fs->target);
++	pw_properties_free(fs->pending);
++	pw_properties_free(fs->metadata);
++	free(fs->restore_target);
++	free(fs);
++	s->filter = NULL;
++}
++
++void filter_stream_properties_changed(struct stream *s, const struct spa_dict *props)
++{
++	struct filter_stream *fs = ensure_stream(s);
++	const struct spa_dict_item *item;
++	if (fs == NULL)
++		return;
++	/* A client writing filter.apply takes ownership, even if the value happens
++	 * to equal the one previously installed by the heuristics. */
++	spa_dict_for_each(item, props)
++		if (spa_streq(item->key, "filter.apply")) {
++			fs->heuristic = false;
++			struct spa_dict_item marker = SPA_DICT_ITEM_INIT("filter.heuristics", NULL);
++			pw_stream_update_properties(s->stream, &SPA_DICT_INIT(&marker, 1));
++			break;
++		}
++}
++
++static void set_property(struct stream *s, const char *key, const char *value)
++{
++	struct spa_dict_item item = SPA_DICT_ITEM_INIT(key, value);
++	pw_stream_update_properties(s->stream, &SPA_DICT_INIT(&item, 1));
++}
++
++static bool has_role(const char *roles, const char *role)
++{
++	size_t len = strlen(role), n;
++	if (roles == NULL)
++		return false;
++	while (*roles) {
++		roles += strspn(roles, " ");
++		n = strcspn(roles, " ");
++		if (n == len && strncmp(roles, role, n) == 0)
++			return true;
++		roles += n;
++	}
++	return false;
++}
++
++static bool wants_echo_cancel(struct filter_stream *fs, struct pw_manager_object *master)
++{
++	struct stream *s = fs->stream;
++	const struct pw_properties *props = pw_stream_get_properties(s->stream);
++	const char *apply = pw_properties_get(props, "filter.apply");
++	const char *want = pw_properties_get(props, "filter.want");
++	bool phone = has_role(object_property(master, PW_KEY_DEVICE_INTENDED_ROLES), "phone");
++
++	if (apply == NULL || fs->heuristic) {
++		if (phone) {
++			if (fs->heuristic && spa_streq(apply, "echo-cancel")) {
++				set_property(s, "filter.apply", NULL);
++				set_property(s, "filter.heuristics", NULL);
++				fs->heuristic = false;
++			}
++		} else if (!spa_streq(apply, want)) {
++			set_property(s, "filter.apply", want);
++			set_property(s, "filter.heuristics", want ? "1" : NULL);
++			fs->heuristic = want != NULL;
++		}
++	}
++	apply = pw_properties_get(props, "filter.apply");
++	return spa_streq(apply, "echo-cancel") &&
++	       !spa_streq(pw_properties_get(props, "filter.suppress"), apply);
++}
++
++static bool same_group(struct filter_stream *a, struct filter_stream *b)
++{
++	static const char *keys[] = { PW_KEY_MEDIA_ROLE, PW_KEY_APP_ID, PW_KEY_APP_NAME, PW_KEY_MEDIA_NAME };
++	const struct pw_properties *pa = pw_stream_get_properties(a->stream->stream);
++	const struct pw_properties *pb = pw_stream_get_properties(b->stream->stream);
++	size_t i;
++	for (i = 0; i < SPA_N_ELEMENTS(keys); i++) {
++		const char *va = pw_properties_get(pa, keys[i]);
++		const char *vb = pw_properties_get(pb, keys[i]);
++		if (va || vb)
++			return spa_streq(va, vb);
++	}
++	return true;
++}
++
++static struct pw_manager_object *find_master(struct filter_stream *fs)
++{
++	struct stream *s = fs->stream;
++	struct client *client = s->client;
++	struct pw_manager_object *o, *best = NULL;
++	const char *target, *name;
++	uint64_t serial;
++	bool by_id = false, sink = s->direction == PW_DIRECTION_OUTPUT;
++	int32_t priority = INT32_MIN;
++
++	if (!fs->automatic && fs->phase == MOVE_IDLE) {
++		o = find_linked(client->manager, s->id, s->direction);
++		return o && !o->removing ? o : NULL;
++	}
++	target = pw_properties_get(fs->target, METADATA_TARGET_OBJECT);
++	if (target == NULL) {
++		target = pw_properties_get(fs->target, METADATA_TARGET_NODE);
++		by_id = target != NULL;
++	}
++	if (target == NULL)
++		target = pw_properties_get(pw_stream_get_properties(s->stream), PW_KEY_TARGET_OBJECT);
++	if (spa_streq(target, "-1"))
++		target = NULL;
++	name = sink ? client->default_sink : client->default_source;
++	spa_list_for_each(o, &client->manager->object_list, link) {
++		int32_t p = 0;
++		const char *node_name;
++		if (o->removing || !(sink ? pw_manager_object_is_sink(o) : pw_manager_object_is_source(o)))
++			continue;
++		node_name = object_property(o, PW_KEY_NODE_NAME);
++		if (target &&
++			(spa_streq(target, node_name) ||
++				(spa_atou64(target, &serial, 10) && serial == (by_id ? o->id : o->serial))))
++			return o;
++		/* Explicitly selecting a filter is allowed, but it must not become
++		 * the fallback master of another automatically loaded filter. */
++		if (spa_streq(object_property(o, "pulse.filter"), "echo-cancel"))
++			continue;
++		if (spa_streq(name, node_name))
++			best = o, priority = INT32_MAX;
++		spa_atoi32(object_property(o, PW_KEY_PRIORITY_SESSION), &p, 10);
++		if (best == NULL || p > priority)
++			best = o, priority = p;
++	}
++	return best;
++}
++
++static struct pw_manager_object *filter_device(struct filter_stream *fs)
++{
++	struct pw_manager_object *o;
++	struct filter *f = fs->filter;
++	uint32_t index;
++	if (f == NULL || f->failed || f->module == NULL || f->module->unloading)
++		return NULL;
++	spa_list_for_each(o, &fs->stream->client->manager->object_list, link)
++		if (!o->removing &&
++			(fs->stream->direction == PW_DIRECTION_OUTPUT ? pw_manager_object_is_sink(o)
++								      : pw_manager_object_is_source(o)) &&
++			spa_atou32(object_property(o, "pulse.module.id"), &index, 10) &&
++			index == f->module->index)
++			return o;
++	return NULL;
++}
++
++/* module_args_add_props() tolerates unterminated quotes and escapes. Reject
++ * these before appending our routing arguments, so they cannot become part
++ * of a parameter value instead of overriding the supplied masters. */
++static bool parameters_valid(const char *p)
++{
++	if (p == NULL)
++		return true;
++	while (*p) {
++		char quote;
++		while (isspace((unsigned char)*p))
++			p++;
++		if (*p == '\0')
++			return true;
++		if ((p = strchr(p, '=')) == NULL)
++			return false;
++		p++;
++		quote = *p == '\'' || *p == '"' ? *p++ : ' ';
++		while (*p && *p != quote) {
++			if (*p == '\\' && *++p == '\0')
++				return false;
++			p++;
++		}
++		if (*p == '\0')
++			return quote == ' ';
++		p++;
++	}
++	return true;
++}
++
++static struct filter *get_filter(
++	struct filter_stream *fs, uint64_t sink, uint64_t source, const char *parameters)
++{
++	struct filter_stream *other;
++	struct filter *f;
++	char *args;
++	int res;
++
++	for (other = fs->stream->impl->filter_streams; other; other = other->next) {
++		f = other->filter;
++		if (f && f->sink == sink && f->source == source && spa_streq(f->parameters, parameters)) {
++			f->ref++;
++			return f;
++		}
++	}
++	if ((f = calloc(1, sizeof(*f))) == NULL)
++		return NULL;
++	f->ref = 1;
++	f->sink = sink;
++	f->source = source;
++	if (parameters && (f->parameters = strdup(parameters)) == NULL) {
++		filter_unref(f);
++		return NULL;
++	}
++	if (!parameters_valid(parameters)) {
++		pw_log_warn("invalid echo cancellation parameters");
++		return f;
++	}
++	/* Masters are serials, so node names cannot inject module arguments. The
++	 * routing arguments come last: filter parameters must not override them. */
++	res = asprintf(&args, "%s autoloaded=1 sink_master=%" PRIu64 " source_master=%" PRIu64,
++		parameters ? parameters : "", sink, source);
++	if (res < 0) {
++		filter_unref(f);
++		return NULL;
++	}
++	f->module = module_create(fs->stream->impl, "module-echo-cancel", args);
++	free(args);
++	if (f->module) {
++		module_add_listener(f->module, &f->listener, &filter_events, f);
++		if ((res = module_load(f->module)) < 0) {
++			pw_log_warn("failed to load echo cancellation: %s", spa_strerror(res));
++			module_unload(f->module);
++		} else {
++			f->module->loaded = true;
++			broadcast_subscribe_event(fs->stream->impl, SUBSCRIPTION_EVENT_MODULE,
++				SUBSCRIPTION_EVENT_NEW, f->module->index);
++		}
++	} else
++		pw_log_warn("failed to prepare echo cancellation: %s", strerror(errno));
++	/* Keep a failed instance until the request changes. Retrying on every
++	 * graph event would spin when the AEC plugin is not installed. */
++	return f;
++}
++
++static int write_targets(struct client *client, uint32_t id, struct pw_properties *props)
++{
++	size_t i;
++	int res;
++	for (i = 0; i < SPA_N_ELEMENTS(target_keys); i++) {
++		const char *value = pw_properties_get(props, target_keys[i]);
++		res = pw_manager_set_metadata(client->manager, client->metadata_default, id, target_keys[i],
++			value ? SPA_TYPE_INFO_BASE "Id" : NULL, value ? "%s" : NULL, value);
++		if (res < 0)
++			return res;
++	}
++	return 0;
++}
++
++static void unguard(struct filter_stream *fs)
++{
++	pw_timer_queue_cancel(&fs->timer);
++	set_property(fs->stream, "state.restore-target", fs->restore_target);
++	fs->phase = MOVE_UNGUARD;
++	pw_manager_sync(fs->stream->client->manager);
++}
++
++static int write_pending(struct filter_stream *fs)
++{
++	size_t i;
++	fs->echoes = 0;
++	for (i = 0; i < SPA_N_ELEMENTS(target_keys); i++)
++		if (!spa_streq(pw_properties_get(fs->pending, target_keys[i]),
++			    pw_properties_get(fs->metadata, target_keys[i])))
++			fs->echoes |= 1u << i;
++	return write_targets(fs->stream->client, fs->stream->id, fs->pending);
++}
++
++static void move_timeout(void *data)
++{
++	struct filter_stream *fs = data;
++	/* If policy cannot link the filter, restore the original metadata while
++	 * it is still protected. Do not leave a stream's preferences disabled. */
++	if (fs->phase == MOVE_WAIT) {
++		pw_properties_clear(fs->pending);
++		pw_properties_update(fs->pending, &fs->target->dict);
++		write_pending(fs);
++		fs->automatic = false;
++		fs->phase = MOVE_ROLLBACK;
++	}
++	if (fs->filter)
++		fs->filter->failed = true;
++	if (fs->phase != MOVE_ROLLBACK)
++		unguard(fs);
++	else
++		pw_manager_sync(fs->stream->client->manager);
++}
++
++static void begin_move(struct filter_stream *fs, struct pw_manager_object *dev, bool restore)
++{
++	struct stream *s = fs->stream;
++	const char *value;
++	if (!fs->guarded) {
++		value = pw_properties_get(pw_stream_get_properties(s->stream), "state.restore-target");
++		free(fs->restore_target);
++		fs->restore_target = value ? strdup(value) : NULL;
++		if (value && fs->restore_target == NULL)
++			return;
++		fs->guarded = true;
++	}
++	pw_properties_clear(fs->pending);
++	if (restore)
++		pw_properties_update(fs->pending, &fs->target->dict);
++	else {
++		pw_properties_setf(fs->pending, METADATA_TARGET_NODE, "%u", dev->id);
++		pw_properties_setf(fs->pending, METADATA_TARGET_OBJECT, "%" PRIu64, dev->serial);
++	}
++	fs->destination = dev ? dev->serial : 0;
++	fs->restoring = restore;
++	set_property(s, "state.restore-target", "false");
++	fs->phase = MOVE_GUARD;
++	pw_manager_sync(s->client->manager);
++	pw_timer_queue_add(s->impl->timer_queue, &fs->timer, NULL, 3 * SPA_NSEC_PER_SEC, move_timeout, fs);
++}
++
++/* Wait for the property update before publishing target metadata. Keep the
++ * guard while filtered; user moves are replayed after removing it. Restoring
++ * the property alone does not generate a target metadata event. */
++static bool advance_move(struct filter_stream *fs, struct pw_manager_object *node)
++{
++	struct stream *s = fs->stream;
++	struct pw_manager_object *peer, *target;
++	int res;
++	switch (fs->phase) {
++	case MOVE_GUARD:
++		if (!spa_streq(object_property(node, "state.restore-target"), "false"))
++			break;
++		res = write_pending(fs);
++		if (res < 0) {
++			pw_properties_clear(fs->pending);
++			pw_properties_update(fs->pending, &fs->target->dict);
++			write_pending(fs);
++			if (fs->filter)
++				fs->filter->failed = true;
++			fs->automatic = false;
++			fs->phase = MOVE_ROLLBACK;
++			break;
++		}
++		fs->automatic = !fs->restoring;
++		fs->phase = MOVE_WAIT;
++		break;
++	case MOVE_WAIT:
++		peer = find_linked(s->client->manager, s->id, s->direction);
++		if (fs->manual || (peer && peer->serial == fs->destination) ||
++			!find_serial(s->client, fs->destination)) {
++			if (fs->manual || fs->restoring)
++				unguard(fs);
++			else {
++				pw_timer_queue_cancel(&fs->timer);
++				fs->phase = MOVE_IDLE;
++			}
++		}
++		break;
++	case MOVE_USER:
++		peer = find_linked(s->client->manager, s->id, s->direction);
++		/* SET_DEFAULT followed immediately by MOVE may arrive before the
++		 * owner's default metadata. Resolve -1 again as defaults catch up. */
++		target = find_master(fs);
++		if (target == NULL || peer == target)
++			fs->phase = MOVE_IDLE;
++		break;
++	case MOVE_UNGUARD:
++		if (spa_streq(object_property(node, "state.restore-target"), fs->restore_target)) {
++			fs->guarded = false;
++			fs->phase = MOVE_IDLE;
++		}
++		break;
++	case MOVE_ROLLBACK:
++		if (fs->echoes == 0)
++			unguard(fs);
++		break;
++	case MOVE_IDLE:
++		if (fs->manual && fs->guarded) {
++			unguard(fs);
++			return true;
++		}
++		return false;
++	}
++	return fs->phase != MOVE_IDLE;
++}
++
++void filter_metadata(struct client *client, uint32_t subject, const char *key, const char *value)
++{
++	struct filter_stream *fs;
++	size_t i;
++	for (fs = client->impl->filter_streams; fs; fs = fs->next) {
++		if (fs->stream->client != client || fs->stream->id != subject)
++			continue;
++		for (i = 0; i < SPA_N_ELEMENTS(target_keys); i++) {
++			if (key && !spa_streq(key, target_keys[i]))
++				continue;
++			pw_properties_set(fs->metadata, target_keys[i], value);
++			if ((fs->echoes & (1u << i)) &&
++				spa_streq(value, pw_properties_get(fs->pending, target_keys[i]))) {
++				fs->echoes &= ~(1u << i);
++				continue;
++			}
++			pw_properties_set(fs->target, target_keys[i], value);
++			/* A move from another metadata client may race our temporary move.
++			 * Replay it once saving is enabled again. */
++			if (fs->guarded)
++				fs->manual = true;
++		}
++		if (fs->manual)
++			promote_stream(fs);
++		return;
++	}
++}
++
++int filter_move_stream(
++	struct client *client, struct pw_manager_object *object, int target_id, int64_t target_serial)
++{
++	struct filter_stream *fs;
++	int res;
++	/* A deferred move must have the same permissions as an immediate one. */
++	if (!SPA_FLAG_IS_SET(object->permissions, PW_PERM_M))
++		return -EACCES;
++	if (client->metadata_default == NULL)
++		return -ENOTSUP;
++	if (!SPA_FLAG_IS_SET(client->metadata_default->permissions, PW_PERM_W | PW_PERM_X))
++		return -EACCES;
++	if (client->metadata_default->proxy == NULL)
++		return -ENOENT;
++	for (fs = client->impl->filter_streams; fs; fs = fs->next) {
++		if (fs->stream->id != object->id || (!fs->automatic && fs->phase == MOVE_IDLE))
++			continue;
++		fs->manual = true;
++		pw_properties_setf(fs->target, METADATA_TARGET_NODE, "%d", target_id);
++		pw_properties_setf(fs->target, METADATA_TARGET_OBJECT, "%" PRIi64, target_serial);
++		promote_stream(fs);
++		filter_process(client->impl);
++		return 0;
++	}
++	if ((res = pw_manager_set_metadata(client->manager, client->metadata_default, object->id,
++		     METADATA_TARGET_NODE, SPA_TYPE_INFO_BASE "Id", "%d", target_id)) < 0)
++		return res;
++	return pw_manager_set_metadata(client->manager, client->metadata_default, object->id,
++		METADATA_TARGET_OBJECT, SPA_TYPE_INFO_BASE "Id", "%" PRIi64, target_serial);
++}
++
++void filter_process(struct impl *impl)
++{
++	struct filter_stream *fs, *other;
++
++	/* Resolve underlying routes and run heuristics before pairing streams. */
++	for (fs = impl->filter_streams; fs; fs = fs->next) {
++		struct stream *s = fs->stream;
++		struct pw_manager_object *node, *master;
++		const struct pw_properties *props = pw_stream_get_properties(s->stream);
++		if (!fs->filter && !fs->automatic && fs->phase == MOVE_IDLE && !fs->manual &&
++			!pw_properties_get(props, "filter.want") &&
++			!pw_properties_get(props, "filter.apply")) {
++			fs->wanted = false;
++			fs->master = 0;
++			continue;
++		}
++		node = stream_object(s);
++		if (node == NULL || advance_move(fs, node))
++			continue;
++		if (fs->manual) {
++			master = find_master(fs);
++			fs->destination = master ? master->serial : 0;
++			write_targets(s->client, s->id, fs->target);
++			fs->manual = false;
++			fs->automatic = false;
++			fs->master = 0;
++			fs->wanted = false;
++			fs->phase = MOVE_USER;
++			filter_unref(fs->filter);
++			fs->filter = NULL;
++			continue;
++		}
++		master = find_master(fs);
++		fs->master = master ? master->serial : 0;
++		fs->wanted =
++			master && wants_echo_cancel(fs, master) &&
++			!spa_atob(pw_properties_get(
++				pw_stream_get_properties(s->stream), PW_KEY_NODE_DONT_RECONNECT)) &&
++			!spa_atob(pw_properties_get(pw_stream_get_properties(s->stream), "node.dont-move")) &&
++			(s->direction == PW_DIRECTION_OUTPUT ? pw_manager_object_is_sink(master)
++							     : pw_manager_object_is_source(master)) &&
++			!spa_streq(object_property(master, "pulse.filter"), "echo-cancel");
++	}
++	for (fs = impl->filter_streams; fs; fs = fs->next) {
++		struct stream *s = fs->stream;
++		struct pw_manager_object *master, *dev;
++		struct filter *f = NULL;
++		const char *parameters;
++
++		if ((!fs->wanted && !fs->filter && !fs->automatic) || !stream_object(s) ||
++			fs->phase != MOVE_IDLE || fs->manual)
++			continue;
++		master = find_serial(s->client, fs->master);
++		if (master == NULL) {
++			filter_unref(fs->filter);
++			fs->filter = NULL;
++			if (fs->automatic)
++				begin_move(fs, NULL, true);
++			continue;
++		}
++		/* Monitor/direct recording and immovable streams must stay where the
++		 * client put them. Do not accidentally construct an AEC feedback loop. */
++		if (fs->wanted && impl->defs.allow_module_loading) {
++			struct filter_stream *capture = NULL, *playback = NULL;
++			struct pw_manager_object *source_master, *sink_master;
++			/* All members of a group use the same master pair. A user move
++			 * promotes that stream, making its new master authoritative. */
++			for (other = impl->filter_streams; other; other = other->next) {
++				if (!other->stream->stream || !other->wanted || !other->master ||
++					!same_group(fs, other))
++					continue;
++				if (!capture && other->stream->direction == PW_DIRECTION_INPUT)
++					capture = other;
++				if (!playback && other->stream->direction == PW_DIRECTION_OUTPUT)
++					playback = other;
++			}
++			if (capture && playback) {
++				/* Use the capture side's parameters consistently for both halves. */
++				source_master = find_serial(capture->stream->client, capture->master);
++				sink_master = find_serial(playback->stream->client, playback->master);
++				if (source_master == NULL || sink_master == NULL)
++					continue;
++				parameters =
++					pw_properties_get(pw_stream_get_properties(capture->stream->stream),
++						"filter.apply.echo-cancel.parameters");
++				if (parameters == NULL)
++					parameters = pw_properties_get(
++						pw_stream_get_properties(playback->stream->stream),
++						"filter.apply.echo-cancel.parameters");
++				if (parameters == NULL)
++					parameters = object_property(
++						source_master, "filter.apply.echo-cancel.parameters");
++				if (parameters == NULL)
++					parameters = object_property(
++						sink_master, "filter.apply.echo-cancel.parameters");
++				f = get_filter(fs, playback->master, capture->master, parameters);
++			}
++		}
++		filter_unref(fs->filter);
++		fs->filter = f;
++		dev = filter_device(fs);
++		if (dev && (!fs->automatic || fs->destination != dev->serial))
++			begin_move(fs, dev, false);
++		else if (fs->automatic && (f == NULL || f->failed || f->module == NULL))
++			begin_move(fs, master, true);
++	}
++}
+diff --git a/src/modules/module-protocol-pulse/filter.h b/src/modules/module-protocol-pulse/filter.h
+new file mode 100644
+index 000000000..c873e2a5d
+--- /dev/null
++++ b/src/modules/module-protocol-pulse/filter.h
+@@ -0,0 +1,22 @@
++/* PipeWire */
++/* SPDX-License-Identifier: MIT */
++
++#ifndef PULSE_SERVER_FILTER_H
++#define PULSE_SERVER_FILTER_H
++
++#include <stdint.h>
++
++struct client;
++struct impl;
++struct stream;
++struct pw_manager_object;
++struct spa_dict;
++
++void filter_process(struct impl *impl);
++void filter_stream_free(struct stream *stream);
++void filter_stream_properties_changed(struct stream *stream, const struct spa_dict *props);
++void filter_metadata(struct client *client, uint32_t subject, const char *key, const char *value);
++int filter_move_stream(
++	struct client *client, struct pw_manager_object *object, int target_id, int64_t target_serial);
++
++#endif
+diff --git a/src/modules/module-protocol-pulse/internal.h b/src/modules/module-protocol-pulse/internal.h
+index 9f9531e7e..80962ca35 100644
+--- a/src/modules/module-protocol-pulse/internal.h
++++ b/src/modules/module-protocol-pulse/internal.h
+@@ -67,6 +67,7 @@ struct impl {
+ 
+ 	struct pw_map samples;
+ 	struct pw_map modules;
++	struct filter_stream *filter_streams;
+ 
+ 	struct spa_list free_messages;
+ 	struct defs defs;
+diff --git a/src/modules/module-protocol-pulse/modules/pulse-module-echo-cancel.c b/src/modules/module-protocol-pulse/modules/pulse-module-echo-cancel.c
+index 6ae7f8e44..fbacdeae5 100644
+--- a/src/modules/module-protocol-pulse/modules/pulse-module-echo-cancel.c
++++ b/src/modules/module-protocol-pulse/modules/pulse-module-echo-cancel.c
+@@ -29,6 +29,7 @@
+ 
+ 
+ static const struct module_args valid_args[] = {
++	{ "autoloaded", "automatically loaded by filter policy", 0, MODULE_TYPE_BOOL, NULL },
+ 	{ "source_name", "name for the source", 0, MODULE_TYPE_STRING, "echo-cancel-source" },
+ 	{ "source_properties", "properties for the source", 0, MODULE_TYPE_PROPS, NULL },
+ 	{ "source_master", "name of source to filter", 0, MODULE_TYPE_STRING, NULL },
+@@ -49,7 +50,6 @@ static const struct module_args valid_args[] = {
+ 	"format=<sample format> "
+ 	"adjust_time=<how often to readjust rates in s> "
+ 	"adjust_threshold=<how much drift to readjust after in ms> "
+-	"autoloaded=<set if this module is being loaded automatically> "
+ 	"save_aec=<save AEC data in /tmp> "
+ 	"use_volume_sharing=<yes or no> "
+ 	"use_master_format=<yes or no> "
+@@ -101,6 +101,24 @@ static int module_echo_cancel_load(struct module *module)
+ 	pw_properties_setf(data->source_props, "pulse.module.id", "%u", module->index);
+ 	pw_properties_setf(data->sink_props, "pulse.module.id", "%u", module->index);
+ 	pw_properties_setf(data->playback_props, "pulse.module.id", "%u", module->index);
++	pw_properties_set(data->source_props, "pulse.filter", "echo-cancel");
++	pw_properties_set(data->sink_props, "pulse.filter", "echo-cancel");
++
++	if (pw_properties_get(module->props, "autoloaded") != NULL &&
++	    module_args_parse_bool(pw_properties_get(module->props, "autoloaded"))) {
++		/* Private names and low priority keep automatic filters out of default
++		 * device selection. Their lifetime belongs to the requesting streams. */
++		pw_properties_setf(data->source_props, PW_KEY_NODE_NAME, "echo-cancel-source-%u", module->index);
++		pw_properties_setf(data->sink_props, PW_KEY_NODE_NAME, "echo-cancel-sink-%u", module->index);
++		pw_properties_set(data->source_props, PW_KEY_PRIORITY_SESSION, "0");
++		pw_properties_set(data->sink_props, PW_KEY_PRIORITY_SESSION, "0");
++		pw_properties_set(data->capture_props, "state.restore-target", "false");
++		pw_properties_set(data->playback_props, "state.restore-target", "false");
++		pw_properties_set(data->capture_props, "node.dont-fallback", "true");
++		pw_properties_set(data->playback_props, "node.dont-fallback", "true");
++		pw_properties_set(data->capture_props, PW_KEY_NODE_PASSIVE, "true");
++		pw_properties_set(data->playback_props, PW_KEY_NODE_PASSIVE, "true");
++	}
+ 
+ 	if ((res = spa_json_builder_memstream(&b, &args, &size, 0)) < 0)
+ 		return res;
+diff --git a/src/modules/module-protocol-pulse/pulse-server.c b/src/modules/module-protocol-pulse/pulse-server.c
+index 7f19739a1..3ac99385e 100644
+--- a/src/modules/module-protocol-pulse/pulse-server.c
++++ b/src/modules/module-protocol-pulse/pulse-server.c
+@@ -41,6 +41,7 @@
+ #include "dbus-name.h"
+ #include "defs.h"
+ #include "extension.h"
++#include "filter.h"
+ #include "format.h"
+ #include "internal.h"
+ #include "manager.h"
+@@ -190,6 +191,7 @@ static void manager_sync(void *data)
+ 	client->ref++;
+ 	spa_list_consume(o, &client->operations, link)
+ 		operation_complete(o);
++	filter_process(client->impl);
+ 	client_unref(client);
+ }
+ 
+@@ -897,6 +899,7 @@ static void manager_added(void *data, struct pw_manager_object *o)
+ 
+ 	/* Adding sinks etc. may also change defaults */
+ 	send_default_change_subscribe_event(client, pw_manager_object_is_sink(o), pw_manager_object_is_source_or_monitor(o));
++	filter_process(impl);
+ }
+ 
+ static void manager_updated(void *data, struct pw_manager_object *o)
+@@ -915,6 +918,7 @@ static void manager_updated(void *data, struct pw_manager_object *o)
+ 
+ 	send_latency_offset_subscribe_event(client, o);
+ 	send_default_change_subscribe_event(client, pw_manager_object_is_sink(o), pw_manager_object_is_source_or_monitor(o));
++	filter_process(impl);
+ }
+ 
+ static void manager_removed(void *data, struct pw_manager_object *o)
+@@ -931,6 +935,7 @@ static void manager_removed(void *data, struct pw_manager_object *o)
+ 		    (str = pw_properties_get(o->props, PW_KEY_METADATA_NAME)) != NULL)
+ 			handle_metadata(client, o, NULL, str);
+ 	}
++	filter_process(client->impl);
+ }
+ 
+ static void manager_object_data_timeout(void *data, struct pw_manager_object *o, const char *key)
+@@ -950,6 +955,9 @@ static void manager_metadata(void *data, struct pw_manager_object *o,
+ 	pw_log_debug("meta id:%d subject:%d key:%s type:%s value:%s",
+ 			o->id, subject, key, type, value);
+ 
++	if (o == client->metadata_default)
++		filter_metadata(client, subject, key, value);
++
+ 	if (subject == PW_ID_CORE && o == client->metadata_default) {
+ 		char name[1024];
+ 
+@@ -1034,6 +1042,7 @@ static void manager_metadata(void *data, struct pw_manager_object *o,
+ 			client->bluetooth_profile_preference = value ? strdup(value) : NULL;
+ 		}
+ 	}
++	filter_process(client->impl);
+ }
+ 
+ 
+@@ -1874,6 +1883,7 @@ static int do_create_playback_stream(struct client *client, uint32_t command, ui
+ 
+ 	pw_log_debug("%p: new stream %p channel:%d passthrough:%d",
+ 			impl, stream, stream->channel, passthrough);
++	filter_stream_properties_changed(stream, &pw_stream_get_properties(stream->stream)->dict);
+ 
+ 	pw_stream_add_listener(stream->stream,
+ 			&stream->stream_listener,
+@@ -2171,6 +2181,7 @@ static int do_create_record_stream(struct client *client, uint32_t command, uint
+ 	if (stream->stream == NULL)
+ 		goto error_errno;
+ 
++	filter_stream_properties_changed(stream, &pw_stream_get_properties(stream->stream)->dict);
+ 	pw_stream_add_listener(stream->stream,
+ 			&stream->stream_listener,
+ 			&stream_events, stream);
+@@ -3327,6 +3338,8 @@ static int do_update_proplist(struct client *client, uint32_t command, uint32_t
+ 
+ 		if (pw_stream_update_properties(stream->stream, &props->dict) > 0)
+ 			stream_update_tag_param(stream);
++		filter_stream_properties_changed(stream, &props->dict);
++		filter_process(client->impl);
+ 	} else {
+ 		if (pw_properties_update(client->props, &props->dict) > 0) {
+ 			client_update_quirks(client);
+@@ -3387,6 +3400,8 @@ static int do_remove_proplist(struct client *client, uint32_t command, uint32_t
+ 			return -ENOENT;
+ 
+ 		pw_stream_update_properties(stream->stream, &dict);
++		filter_stream_properties_changed(stream, &dict);
++		filter_process(client->impl);
+ 	} else {
+ 		pw_core_update_properties(client->core, &dict);
+ 	}
+@@ -4996,16 +5011,7 @@ static int do_move_stream(struct client *client, uint32_t command, uint32_t tag,
+ 		target_serial = dev->serial;
+ 	}
+ 
+-	if ((res = pw_manager_set_metadata(manager, client->metadata_default,
+-			o->id,
+-			METADATA_TARGET_NODE,
+-			SPA_TYPE_INFO_BASE"Id", "%d", target_id)) < 0)
+-		return res;
+-
+-	if ((res = pw_manager_set_metadata(manager, client->metadata_default,
+-			o->id,
+-			METADATA_TARGET_OBJECT,
+-			SPA_TYPE_INFO_BASE"Id", "%"PRIi64, target_serial)) < 0)
++	if ((res = filter_move_stream(client, o, target_id, target_serial)) < 0)
+ 		return res;
+ 
+ 	name = spa_dict_lookup(info->props, PW_KEY_NODE_NAME);
+diff --git a/src/modules/module-protocol-pulse/stream.c b/src/modules/module-protocol-pulse/stream.c
+index 5c9f01107..6aab51178 100644
+--- a/src/modules/module-protocol-pulse/stream.c
++++ b/src/modules/module-protocol-pulse/stream.c
+@@ -21,6 +21,7 @@
+ #include "client.h"
+ #include "commands.h"
+ #include "defs.h"
++#include "filter.h"
+ #include "internal.h"
+ #include "log.h"
+ #include "message.h"
+@@ -86,6 +87,7 @@ struct stream *stream_new(struct client *client, enum stream_type type, uint32_t
+ 	spa_ringbuffer_init(&stream->ring);
+ 
+ 	stream->peer_index = SPA_ID_INVALID;
++	stream->id = SPA_ID_INVALID;
+ 
+ 	parse_frac(client->props, "pulse.min.req", &defs->min_req, &stream->min_req);
+ 	parse_frac(client->props, "pulse.min.frag", &defs->min_frag, &stream->min_frag);
+@@ -148,6 +150,8 @@ void stream_free(struct stream *stream)
+ 	if (stream->killed)
+ 		stream_send_killed(stream);
+ 
++	filter_stream_free(stream);
++
+ 	if (stream->stream) {
+ 		spa_hook_remove(&stream->stream_listener);
+ 		pw_stream_disconnect(stream->stream);
+diff --git a/src/modules/module-protocol-pulse/stream.h b/src/modules/module-protocol-pulse/stream.h
+index 8e1fe178c..016c4d9ca 100644
+--- a/src/modules/module-protocol-pulse/stream.h
++++ b/src/modules/module-protocol-pulse/stream.h
+@@ -47,6 +47,7 @@ struct stream {
+ 	enum pw_direction direction;
+ 
+ 	struct pw_properties *props;
++	struct filter_stream *filter;
+ 
+ 	struct pw_stream *stream;
+ 	struct spa_hook stream_listener;
+diff --git a/src/modules/module-protocol-pulse/test-filter.c b/src/modules/module-protocol-pulse/test-filter.c
+new file mode 100644
+index 000000000..64ecec894
+--- /dev/null
++++ b/src/modules/module-protocol-pulse/test-filter.c
+@@ -0,0 +1,626 @@
++/* PipeWire */
++/* SPDX-License-Identifier: MIT */
++
++/* Run the policy against a deterministic asynchronous graph. Property updates,
++ * metadata echoes and links are deliberately delivered on separate turns. */
++#define pw_stream_get_properties test_stream_get_properties
++#define pw_stream_update_properties test_stream_update_properties
++#define pw_timer_queue_add test_timer_queue_add
++#define pw_timer_queue_cancel test_timer_queue_cancel
++#include "filter.c"
++
++struct spa_log_topic *const mod_topic = NULL;
++
++struct test_stream {
++	struct stream stream;
++	struct pw_properties *props, *observed, *metadata;
++	struct pw_node_info info;
++	struct pw_manager_object *node;
++	uint64_t peer;
++	char *saved;
++};
++
++static struct {
++	struct impl impl;
++	struct client client;
++	struct pw_manager manager;
++	struct pw_manager_object objects[32];
++	struct test_stream streams[3];
++	struct module *modules[16];
++	unsigned int n_objects, n_modules, loads, unloads, writes;
++	bool fail_load, block_link;
++	struct {
++		uint32_t subject;
++		const char *key;
++		char *value;
++	} events[128];
++	unsigned int n_events;
++} test;
++
++void broadcast_subscribe_event(struct impl *impl, uint32_t facility, uint32_t type, uint32_t id)
++{
++	spa_assert_se(facility == SUBSCRIPTION_EVENT_MODULE);
++	spa_assert_se(type == SUBSCRIPTION_EVENT_NEW);
++}
++
++int pw_manager_sync(struct pw_manager *manager)
++{
++	return 0;
++}
++
++static struct pw_manager_object *add_object(const char *name, const char *media_class)
++{
++	struct pw_manager_object *o = &test.objects[test.n_objects++];
++	spa_assert_se(test.n_objects <= SPA_N_ELEMENTS(test.objects));
++	o->id = test.n_objects;
++	o->serial = o->id + 100;
++	o->type = PW_TYPE_INTERFACE_Node;
++	o->permissions = PW_PERM_ALL;
++	o->props = pw_properties_new(PW_KEY_NODE_NAME, name, PW_KEY_MEDIA_CLASS, media_class, NULL);
++	spa_list_append(&test.manager.object_list, &o->link);
++	return o;
++}
++
++bool pw_manager_object_is_sink(struct pw_manager_object *o)
++{
++	return spa_streq(pw_properties_get(o->props, PW_KEY_MEDIA_CLASS), "Audio/Sink");
++}
++
++bool pw_manager_object_is_source(struct pw_manager_object *o)
++{
++	return spa_streq(pw_properties_get(o->props, PW_KEY_MEDIA_CLASS), "Audio/Source");
++}
++
++struct pw_manager_object *find_linked(struct pw_manager *manager, uint32_t id, enum pw_direction direction)
++{
++	size_t i;
++	for (i = 0; i < SPA_N_ELEMENTS(test.streams); i++)
++		if (test.streams[i].stream.id == id)
++			return find_serial(&test.client, test.streams[i].peer);
++	return NULL;
++}
++
++const struct pw_properties *test_stream_get_properties(struct pw_stream *stream)
++{
++	return ((struct test_stream *)stream)->props;
++}
++
++int test_stream_update_properties(struct pw_stream *stream, const struct spa_dict *dict)
++{
++	return pw_properties_update(((struct test_stream *)stream)->props, dict);
++}
++
++int test_timer_queue_add(struct pw_timer_queue *queue, struct pw_timer *timer, struct timespec *abs_time,
++	int64_t timeout, pw_timer_callback callback, void *data)
++{
++	timer->callback = callback;
++	timer->data = data;
++	return 0;
++}
++
++int test_timer_queue_cancel(struct pw_timer *timer)
++{
++	timer->callback = NULL;
++	return 0;
++}
++
++struct module *module_create(struct impl *impl, const char *name, const char *args)
++{
++	struct module *m = calloc(1, sizeof(*m));
++	spa_assert_se(spa_streq(name, "module-echo-cancel"));
++	spa_assert_se(strstr(args, "autoloaded=1") != NULL);
++	m->index = ++test.n_modules;
++	spa_assert_se(m->index < SPA_N_ELEMENTS(test.modules));
++	m->args = strdup(args);
++	spa_hook_list_init(&m->listener_list);
++	test.modules[m->index] = m;
++	return m;
++}
++
++void module_add_listener(
++	struct module *m, struct spa_hook *listener, const struct module_events *events, void *data)
++{
++	spa_hook_list_append(&m->listener_list, listener, events, data);
++}
++
++int module_load(struct module *m)
++{
++	struct pw_manager_object *sink, *source;
++	test.loads++;
++	if (test.fail_load)
++		return -ENOENT;
++	sink = add_object("filter-sink", "Audio/Sink");
++	source = add_object("filter-source", "Audio/Source");
++	pw_properties_set(sink->props, "pulse.filter", "echo-cancel");
++	pw_properties_set(source->props, "pulse.filter", "echo-cancel");
++	pw_properties_setf(sink->props, "pulse.module.id", "%u", m->index);
++	pw_properties_setf(source->props, "pulse.module.id", "%u", m->index);
++	return 0;
++}
++
++int module_unload(struct module *m)
++{
++	size_t i;
++	for (i = 0; i < test.n_objects; i++) {
++		uint32_t index;
++		struct pw_manager_object *o = &test.objects[i];
++		if (spa_atou32(pw_properties_get(o->props, "pulse.module.id"), &index, 10) &&
++			index == m->index)
++			o->removing = true;
++	}
++	module_emit_destroy(m);
++	test.modules[m->index] = NULL;
++	free((char *)m->args);
++	free(m);
++	test.unloads++;
++	return 0;
++}
++
++void module_schedule_unload(struct module *m)
++{
++	m->unloading = true;
++}
++
++int pw_manager_set_metadata(struct pw_manager *manager, struct pw_manager_object *metadata, uint32_t subject,
++	const char *key, const char *type, const char *format, ...)
++{
++	unsigned int i = test.n_events++;
++	va_list args;
++	spa_assert_se(i < SPA_N_ELEMENTS(test.events));
++	test.events[i].subject = subject;
++	test.events[i].key = key;
++	if (type) {
++		va_start(args, format);
++		spa_assert_se(vasprintf(&test.events[i].value, format, args) >= 0);
++		va_end(args);
++	}
++	test.writes++;
++	return 0;
++}
++
++static void tick(void)
++{
++	unsigned int i, j, n;
++	/* Registry property updates arrive before the corresponding metadata. */
++	for (i = 0; i < SPA_N_ELEMENTS(test.streams); i++) {
++		struct test_stream *ts = &test.streams[i];
++		if (!ts->props)
++			continue;
++		pw_properties_clear(ts->observed);
++		pw_properties_update(ts->observed, &ts->props->dict);
++	}
++	n = test.n_events;
++	test.n_events = 0;
++	for (i = 0; i < n; i++) {
++		for (j = 0; j < SPA_N_ELEMENTS(test.streams); j++) {
++			struct test_stream *ts = &test.streams[j];
++			if (!ts->props || ts->stream.id != test.events[i].subject)
++				continue;
++			pw_properties_set(ts->metadata, test.events[i].key, test.events[i].value);
++			if (!spa_streq(pw_properties_get(ts->observed, "state.restore-target"), "false")) {
++				free(ts->saved);
++				ts->saved = test.events[i].value ? strdup(test.events[i].value) : NULL;
++			}
++			filter_metadata(
++				&test.client, ts->stream.id, test.events[i].key, test.events[i].value);
++		}
++		free(test.events[i].value);
++		test.events[i].value = NULL;
++	}
++	for (i = 0; i < SPA_N_ELEMENTS(test.streams); i++) {
++		struct test_stream *ts = &test.streams[i];
++		const char *value;
++		uint64_t serial;
++		if (!ts->props || test.block_link)
++			continue;
++		value = pw_properties_get(ts->metadata, METADATA_TARGET_OBJECT);
++		if (value && spa_atou64(value, &serial, 10) && find_serial(&test.client, serial))
++			ts->peer = serial;
++		else if (!value || spa_streq(value, "-1")) {
++			const char *name = ts->stream.direction == PW_DIRECTION_OUTPUT
++						   ? test.client.default_sink
++						   : test.client.default_source;
++			for (j = 0; j < test.n_objects; j++)
++				if (spa_streq(
++					    pw_properties_get(test.objects[j].props, PW_KEY_NODE_NAME), name))
++					ts->peer = test.objects[j].serial;
++		}
++	}
++	for (i = 1; i <= test.n_modules; i++)
++		if (test.modules[i] && test.modules[i]->unloading)
++			module_unload(test.modules[i]);
++	filter_process(&test.impl);
++}
++
++static void settle(void)
++{
++	unsigned int i;
++	for (i = 0; i < 12; i++)
++		tick();
++}
++
++static void setup(void)
++{
++	unsigned int i;
++	spa_zero(test);
++	spa_list_init(&test.manager.object_list);
++	test.client.impl = &test.impl;
++	test.client.manager = &test.manager;
++	test.client.default_sink = "speaker";
++	test.client.default_source = "microphone";
++	test.impl.defs.allow_module_loading = true;
++	add_object("speaker", "Audio/Sink");
++	add_object("microphone", "Audio/Source");
++	add_object("phone", "Audio/Sink");
++	test.client.metadata_default = &test.objects[2];
++	test.objects[2].proxy = (struct pw_proxy *)&test;
++	pw_properties_set(test.objects[2].props, PW_KEY_DEVICE_INTENDED_ROLES, "music phone");
++	for (i = 0; i < 2; i++) {
++		struct test_stream *ts = &test.streams[i];
++		ts->props = pw_properties_new(
++			"filter.want", "echo-cancel", PW_KEY_MEDIA_ROLE, "Communication", NULL);
++		ts->observed = pw_properties_copy(ts->props);
++		ts->metadata = pw_properties_new(NULL, NULL);
++		ts->node = add_object("stream", i == 0 ? "Stream/Output/Audio" : "Stream/Input/Audio");
++		ts->info.props = &ts->observed->dict;
++		ts->node->info = &ts->info;
++		ts->stream.id = ts->node->id;
++		ts->stream.client = &test.client;
++		ts->stream.impl = &test.impl;
++		ts->stream.direction = i == 0 ? PW_DIRECTION_OUTPUT : PW_DIRECTION_INPUT;
++		ts->stream.stream = (struct pw_stream *)ts;
++		ts->peer = test.objects[i].serial;
++		ts->saved = strdup("original");
++		spa_assert_se(ensure_stream(&ts->stream) != NULL);
++	}
++}
++
++static void cleanup(void)
++{
++	unsigned int i;
++	for (i = 0; i < SPA_N_ELEMENTS(test.streams); i++) {
++		struct test_stream *ts = &test.streams[i];
++		filter_stream_free(&ts->stream);
++		pw_properties_free(ts->props);
++		pw_properties_free(ts->observed);
++		pw_properties_free(ts->metadata);
++		free(ts->saved);
++	}
++	for (i = 1; i <= test.n_modules; i++)
++		if (test.modules[i])
++			module_unload(test.modules[i]);
++	for (i = 0; i < test.n_objects; i++)
++		pw_properties_free(test.objects[i].props);
++	for (i = 0; i < test.n_events; i++)
++		free(test.events[i].value);
++	pw_properties_free(test.client.props);
++}
++
++static void test_heuristics(void)
++{
++	struct filter_stream *fs;
++	struct pw_properties *props;
++	setup();
++	fs = test.streams[0].stream.filter;
++	props = test.streams[0].props;
++	spa_assert_se(wants_echo_cancel(fs, &test.objects[0]));
++	spa_assert_se(fs->heuristic);
++	spa_assert_se(!wants_echo_cancel(fs, &test.objects[2]));
++	spa_assert_se(pw_properties_get(props, "filter.apply") == NULL);
++	pw_properties_set(props, "filter.apply", "echo-cancel");
++	spa_assert_se(wants_echo_cancel(fs, &test.objects[2]));
++	pw_properties_set(props, "filter.apply", "");
++	spa_assert_se(!wants_echo_cancel(fs, &test.objects[0]));
++	pw_properties_set(props, "filter.apply", "other-filter");
++	spa_assert_se(!wants_echo_cancel(fs, &test.objects[0]));
++	pw_properties_set(props, "filter.apply", "echo-cancel");
++	pw_properties_set(props, "filter.suppress", "echo-cancel");
++	spa_assert_se(!wants_echo_cancel(fs, &test.objects[0]));
++	spa_assert_se(!has_role("headphone telephone", "phone"));
++	spa_assert_se(has_role("  music phone  ", "phone"));
++	cleanup();
++}
++
++static void test_pair_and_restore(void)
++{
++	struct filter_stream *a, *b;
++	setup();
++	settle();
++	a = test.streams[0].stream.filter;
++	b = test.streams[1].stream.filter;
++	spa_assert_se(test.loads == 1);
++	spa_assert_se(a->filter == b->filter);
++	spa_assert_se(a->automatic && b->automatic);
++	spa_assert_se(a->phase == MOVE_IDLE && b->phase == MOVE_IDLE);
++	spa_assert_se(spa_streq(test.streams[0].saved, "original"));
++	spa_assert_se(spa_streq(test.streams[1].saved, "original"));
++	pw_properties_set(test.streams[0].props, "filter.want", NULL);
++	pw_properties_set(test.streams[1].props, "filter.want", NULL);
++	settle();
++	spa_assert_se(!a->automatic && !b->automatic);
++	spa_assert_se(!a->guarded && !b->guarded);
++	spa_assert_se(test.streams[0].peer == test.objects[0].serial);
++	spa_assert_se(test.streams[1].peer == test.objects[1].serial);
++	spa_assert_se(spa_streq(test.streams[0].saved, "original"));
++	spa_assert_se(test.unloads == 1);
++	cleanup();
++}
++
++static void test_manual_move(void)
++{
++	setup();
++	settle();
++	spa_assert_se(filter_move_stream(&test.client, test.streams[0].node, test.objects[2].id,
++			      test.objects[2].serial) == 0);
++	settle();
++	spa_assert_se(test.streams[0].peer == test.objects[2].serial);
++	spa_assert_se(spa_streq(test.streams[0].saved, "103"));
++	spa_assert_se(!test.streams[0].stream.filter->automatic);
++	spa_assert_se(!test.streams[1].stream.filter->automatic);
++	/* A move to the default still clears the preference with -1. */
++	spa_assert_se(filter_move_stream(&test.client, test.streams[0].node, -1, -1) == 0);
++	settle();
++	spa_assert_se(spa_streq(test.streams[0].saved, "-1"));
++	spa_assert_se(test.streams[0].stream.filter->automatic);
++	cleanup();
++}
++
++static void test_failure_and_grouping(void)
++{
++	setup();
++	test.fail_load = true;
++	settle();
++	spa_assert_se(test.loads == 1);
++	spa_assert_se(!test.streams[0].stream.filter->automatic);
++	spa_assert_se(test.writes == 0);
++	cleanup();
++
++	setup();
++	pw_properties_set(test.streams[1].props, PW_KEY_MEDIA_ROLE, "Music");
++	settle();
++	spa_assert_se(test.loads == 0);
++	cleanup();
++
++	setup();
++	pw_properties_set(test.streams[1].props, PW_KEY_NODE_DONT_RECONNECT, "true");
++	settle();
++	spa_assert_se(test.loads == 0);
++	cleanup();
++}
++
++static void test_defaults_and_preferences(void)
++{
++	struct test_stream *ts;
++	setup();
++	settle();
++	test.client.default_sink = "phone";
++	settle();
++	spa_assert_se(!test.streams[0].stream.filter->automatic);
++	spa_assert_se(!test.streams[1].stream.filter->automatic);
++	spa_assert_se(spa_streq(test.streams[0].saved, "original"));
++	test.client.default_sink = "speaker";
++	settle();
++	spa_assert_se(test.streams[0].stream.filter->automatic);
++	cleanup();
++
++	setup();
++	ts = &test.streams[0];
++	/* An existing nondefault preference survives applying and removing AEC. */
++	pw_properties_set(ts->metadata, METADATA_TARGET_OBJECT, "101");
++	pw_properties_set(ts->stream.filter->target, METADATA_TARGET_OBJECT, "101");
++	free(ts->saved);
++	ts->saved = strdup("101");
++	settle();
++	test.client.default_sink = "phone";
++	settle();
++	spa_assert_se(ts->stream.filter->automatic);
++	spa_assert_se(ts->stream.filter->filter->sink == 101);
++	pw_properties_set(ts->props, "filter.suppress", "echo-cancel");
++	settle();
++	spa_assert_se(!ts->stream.filter->automatic);
++	spa_assert_se(ts->peer == 101);
++	spa_assert_se(spa_streq(pw_properties_get(ts->metadata, METADATA_TARGET_OBJECT), "101"));
++	spa_assert_se(spa_streq(ts->saved, "101"));
++	cleanup();
++}
++
++static void test_inflight_move_and_timeout(void)
++{
++	struct test_stream *ts;
++	struct filter_stream *fs;
++	setup();
++	tick();
++	ts = &test.streams[0];
++	spa_assert_se(ts->stream.filter->phase == MOVE_GUARD);
++	spa_assert_se(filter_move_stream(&test.client, ts->node, 3, 103) == 0);
++	settle();
++	spa_assert_se(ts->peer == 103);
++	spa_assert_se(spa_streq(ts->saved, "103"));
++	cleanup();
++
++	setup();
++	test.block_link = true;
++	settle();
++	ts = &test.streams[0];
++	fs = ts->stream.filter;
++	spa_assert_se(fs->phase == MOVE_WAIT);
++	spa_assert_se(fs->timer.callback != NULL);
++	fs->timer.callback(fs->timer.data);
++	settle();
++	spa_assert_se(!fs->guarded);
++	spa_assert_se(!fs->automatic);
++	spa_assert_se(test.loads == 1);
++	spa_assert_se(spa_streq(ts->saved, "original"));
++	cleanup();
++}
++
++static void test_explicit_update_and_unload(void)
++{
++	struct test_stream *ts;
++	struct spa_dict_item item = SPA_DICT_ITEM_INIT("filter.apply", "echo-cancel");
++	setup();
++	settle();
++	ts = &test.streams[0];
++	/* Writing the same value still changes ownership of filter.apply. */
++	filter_stream_properties_changed(&ts->stream, &SPA_DICT_INIT(&item, 1));
++	spa_assert_se(!ts->stream.filter->heuristic);
++	test.client.default_sink = "phone";
++	settle();
++	spa_assert_se(ts->stream.filter->automatic);
++	spa_assert_se(ts->stream.filter->filter->sink == 103);
++	module_unload(ts->stream.filter->filter->module);
++	settle();
++	spa_assert_se(!ts->stream.filter->automatic);
++	spa_assert_se(!ts->stream.filter->guarded);
++	spa_assert_se(spa_streq(ts->saved, "original"));
++	cleanup();
++}
++
++static void test_external_move_and_guard(void)
++{
++	struct test_stream *ts;
++	setup();
++	settle();
++	ts = &test.streams[0];
++	/* An external metadata writer's move must eventually be saved, even
++	 * though its first write arrives while the automatic route is guarded. */
++	pw_manager_set_metadata(&test.manager, test.client.metadata_default, ts->stream.id,
++		METADATA_TARGET_NODE, SPA_TYPE_INFO_BASE "Id", "%u", 3u);
++	pw_manager_set_metadata(&test.manager, test.client.metadata_default, ts->stream.id,
++		METADATA_TARGET_OBJECT, SPA_TYPE_INFO_BASE "Id", "%u", 103u);
++	settle();
++	spa_assert_se(ts->peer == 103);
++	spa_assert_se(spa_streq(ts->saved, "103"));
++	spa_assert_se(!ts->stream.filter->guarded);
++	cleanup();
++
++	setup();
++	ts = &test.streams[0];
++	pw_properties_set(ts->props, "state.restore-target", "false");
++	settle();
++	pw_properties_set(ts->props, "filter.want", NULL);
++	settle();
++	spa_assert_se(!ts->stream.filter->guarded);
++	spa_assert_se(spa_streq(pw_properties_get(ts->props, "state.restore-target"), "false"));
++	cleanup();
++
++	setup();
++	test.impl.defs.allow_module_loading = false;
++	settle();
++	spa_assert_se(test.loads == 0);
++	spa_assert_se(test.writes == 0);
++	cleanup();
++}
++
++static void test_parameters(void)
++{
++	const char *args;
++	spa_assert_se(parameters_valid(NULL));
++	spa_assert_se(parameters_valid("aec_method=webrtc aec_args='noise_suppression=1'"));
++	spa_assert_se(!parameters_valid("aec_args='"));
++	spa_assert_se(!parameters_valid("aec_args=test\\"));
++	setup();
++	pw_properties_set(test.streams[0].props, "filter.apply.echo-cancel.parameters", "aec_method=null");
++	settle();
++	spa_assert_se(test.loads == 1);
++	args = test.streams[0].stream.filter->filter->module->args;
++	spa_assert_se(strstr(args, "aec_method=null") != NULL);
++	spa_assert_se(strstr(args, "sink_master=101 source_master=102") != NULL);
++	cleanup();
++
++	setup();
++	pw_properties_set(test.streams[1].props, "filter.apply.echo-cancel.parameters", "aec_args='");
++	settle();
++	spa_assert_se(test.loads == 0);
++	spa_assert_se(test.writes == 0);
++	cleanup();
++}
++
++static void test_group_members(void)
++{
++	struct test_stream *ts;
++	struct filter *f;
++	setup();
++	pw_properties_set(test.objects[2].props, PW_KEY_DEVICE_INTENDED_ROLES, NULL);
++	ts = &test.streams[2];
++	ts->props = pw_properties_copy(test.streams[0].props);
++	ts->observed = pw_properties_copy(ts->props);
++	ts->metadata = pw_properties_new(METADATA_TARGET_OBJECT, "103", NULL);
++	ts->node = add_object("second-playback", "Stream/Output/Audio");
++	ts->info.props = &ts->observed->dict;
++	ts->node->info = &ts->info;
++	ts->stream = (struct stream){ .id = ts->node->id,
++		.client = &test.client,
++		.impl = &test.impl,
++		.direction = PW_DIRECTION_OUTPUT,
++		.stream = (struct pw_stream *)ts };
++	ts->peer = 103;
++	ts->saved = strdup("103");
++	spa_assert_se(ensure_stream(&ts->stream) != NULL);
++	filter_metadata(&test.client, ts->stream.id, METADATA_TARGET_OBJECT, "103");
++	settle();
++	f = ts->stream.filter->filter;
++	spa_assert_se(f != NULL && f->sink == 103);
++	spa_assert_se(test.streams[0].stream.filter->filter == f);
++	spa_assert_se(test.streams[1].stream.filter->filter == f);
++	spa_assert_se(test.loads == 1);
++	/* Moving another group member changes the master for the whole group. */
++	spa_assert_se(filter_move_stream(&test.client, test.streams[0].node, -1, -1) == 0);
++	settle();
++	f = ts->stream.filter->filter;
++	spa_assert_se(f != NULL && f->sink == 101);
++	spa_assert_se(test.streams[0].stream.filter->filter == f);
++	spa_assert_se(test.streams[1].stream.filter->filter == f);
++	spa_assert_se(spa_streq(ts->saved, "103"));
++	cleanup();
++}
++
++static void test_client_properties(void)
++{
++	struct test_stream *ts;
++	setup();
++	ts = &test.streams[0];
++	filter_stream_free(&ts->stream);
++	pw_properties_set(ts->props, "filter.want", NULL);
++	pw_properties_set(ts->props, PW_KEY_MEDIA_ROLE, NULL);
++	test.client.props = pw_properties_new("filter.want", "echo-cancel", PW_KEY_MEDIA_ROLE,
++		"Communication", PW_KEY_APP_ID, "org.jami.Jami", NULL);
++	spa_assert_se(ensure_stream(&ts->stream) != NULL);
++	spa_assert_se(spa_streq(pw_properties_get(ts->props, "filter.want"), "echo-cancel"));
++	spa_assert_se(spa_streq(pw_properties_get(ts->props, PW_KEY_APP_ID), "org.jami.Jami"));
++	settle();
++	spa_assert_se(test.loads == 1);
++	cleanup();
++}
++
++static void test_pending_default(void)
++{
++	setup();
++	settle();
++	/* The controller has received SET_DEFAULT, but the stream owner has not
++	 * received the new default metadata when MOVE clears its preference. */
++	spa_assert_se(filter_move_stream(&test.client, test.streams[0].node, -1, -1) == 0);
++	test.client.default_sink = "phone";
++	settle();
++	spa_assert_se(test.streams[0].peer == 103);
++	spa_assert_se(test.streams[0].stream.filter->phase == MOVE_IDLE);
++	spa_assert_se(spa_streq(test.streams[0].saved, "-1"));
++	cleanup();
++}
++
++int main(void)
++{
++	test_heuristics();
++	test_pair_and_restore();
++	test_manual_move();
++	test_failure_and_grouping();
++	test_defaults_and_preferences();
++	test_inflight_move_and_timeout();
++	test_explicit_update_and_unload();
++	test_external_move_and_guard();
++	test_parameters();
++	test_group_members();
++	test_client_properties();
++	test_pending_default();
++	return 0;
++}
+-- 
+2.55.0.windows.3
