@@ -27,6 +27,8 @@ jobs:
           git clone --filter=blob:none https://gitlab.freedesktop.org/pipewire/pipewire.git pipewire
           cd pipewire
           git checkout 4cd2f7cb1
+          git config user.name "Franklin Wilster"
+          git config user.email "64386813+franklincg@users.noreply.github.com"
           git am "$GITHUB_WORKSPACE/.github/pipewire-echo-cancel.patch"
 
       - name: Configure
